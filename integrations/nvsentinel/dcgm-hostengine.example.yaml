@@ -1,0 +1,52 @@
+# Standalone DCGM host engine for NVSentinel's gpu-health-monitor on clusters that do
+# NOT run the NVIDIA GPU Operator (for example EKS NVIDIA AMIs with host drivers and
+# the nvidia container runtime). Mirrors GPU Operator's state-dcgm assets: privileged
+# DaemonSet plus a Service with internalTrafficPolicy: Local so each node's monitor
+# reaches its own host engine. Point NVSentinel at it with:
+#   global.dcgm.mode: operator-service
+#   global.dcgm.service.endpoint: nvidia-dcgm.nvidia-dcgm.svc
+#   global.dcgm.service.port: 5555
+# Validated with dcgm:4.6.0 and NVSentinel v1.22.0. Adjust nodeSelector/tolerations
+# to your GPU node groups.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nvidia-dcgm
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-dcgm
+  namespace: nvidia-dcgm
+  labels: {app: nvidia-dcgm}
+spec:
+  selector: {matchLabels: {app: nvidia-dcgm}}
+  template:
+    metadata: {labels: {app: nvidia-dcgm}}
+    spec:
+      nodeSelector: {nvidia.com/gpu.present: "true"}
+      tolerations:
+        - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+      priorityClassName: system-node-critical
+      containers:
+        - name: nvidia-dcgm-ctr
+          image: nvcr.io/nvidia/cloud-native/dcgm:4.6.0-1-ubuntu24.04
+          env:
+            - {name: NVIDIA_VISIBLE_DEVICES, value: all}
+            - {name: NVIDIA_DRIVER_CAPABILITIES, value: all}
+          securityContext: {privileged: true}
+          ports: [{name: dcgm, containerPort: 5555}]
+          readinessProbe: {tcpSocket: {port: 5555}, initialDelaySeconds: 15}
+          livenessProbe: {tcpSocket: {port: 5555}, initialDelaySeconds: 15}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nvidia-dcgm
+  namespace: nvidia-dcgm
+  labels: {app: nvidia-dcgm}
+spec:
+  internalTrafficPolicy: Local
+  type: ClusterIP
+  selector: {app: nvidia-dcgm}
+  ports: [{name: dcgm, port: 5555, protocol: TCP}]

@@ -1,13 +1,59 @@
 # Live validation record
 
-Package version 0.2.3 (policy and adapter behavior identical to the 0.2.1 run except where noted). Validated 2026-09-16 on an isolated, non-production Amazon EKS
-cluster (Kubernetes v1.36, us-west-2) using images built from this repository with
-the packaged Dockerfiles and deployed from the packaged manifests (placeholders
-rendered, nothing else changed). Karpenter provisioned the disposable c6a.large test
-nodes; it is **not** part of the solution and none of the results below say anything
-about Cluster Autoscaler, managed-node-group, or Auto Scaling group behavior.
+Two live runs, both on 2026-09-16, both on an isolated, non-production Amazon EKS
+cluster (Kubernetes v1.36, us-west-2), both using images built from this repository
+with the packaged Dockerfiles and deployed from the packaged manifests (placeholders
+rendered, nothing else changed). Offline suite: `python -m pytest tests -q` passed
+(66 tests) against the same source.
 
-Offline suite: `python -m pytest tests -q` passed (66 tests) against the same source.
+- **Run A** (package 0.2.1/0.2.3): controller and adapter semantics on CPU nodes that
+  Karpenter provisioned. Karpenter is not part of the solution; Run A says nothing
+  about node replacement.
+- **Run B** (package 0.2.3): the production shape. Cluster Autoscaler owning two EKS
+  managed node groups (one CPU, one GPU), upstream NTH, full upstream NVSentinel in
+  custom-drain mode, and a two-GPU JobSet. Karpenter was fenced off from these node
+  groups (it refused every pod pinned to them) so no result below is contaminated by it.
+
+## Run B: Cluster Autoscaler + managed node groups + NVSentinel + GPU
+
+Component versions, all pinned: Cluster Autoscaler v1.36.1 (chart 9.59.0,
+autodiscovery by tag, 2 m unneeded/scale-down timers, EKS Pod Identity); managed node
+groups on `AL2023_x86_64_NVIDIA` (GPU, landed on g5.xlarge / NVIDIA A10G) and
+`AL2023_x86_64_STANDARD` (CPU, c6a.large), both min 0; NVIDIA device plugin v0.20.0;
+standalone DCGM 4.6.0 hostengine DaemonSet; NVSentinel v1.22.0 (operator-service DCGM
+mode, fault-quarantine, node-drainer `customDrain` pointing at this CRD, MongoDB store
+on gp2 via aws-ebs-csi-driver v1.66.0); NTH 1.25.6 (chart 0.27.6); JobSet v0.12.0.
+Both node groups carried the managed label values and the
+`aws-node-termination-handler/managed=true` instance tag from the launch template.
+
+| # | Scenario | Observed | Result |
+|---|---|---|---|
+| B1 | Real GPU fault through the whole NVSentinel chain. `dcgmi test --inject -f 230 -v 95` (XID-class fatal) on the A10G. | gpu-health-monitor raised the event; fault-quarantine cordoned the Node and labeled it `cordon-reason=GPU-fatal-error-ruleset`; node-drainer rendered `drain-<node>-<eventID>` in `nvsentinel` from the packaged template; controller `TargetsLocked` 6 s later, evicted the CUDA pod, `Completed` with `DrainComplete=True` 46 s after injection; node-drainer logged "Drain CR completed" and deleted the DrainRequest. No hand edits anywhere in the chain. | Pass |
+| B2 | Cluster Autoscaler replaces after a drain. | The evicted pod went Pending; CA scaled the GPU node group 1 -> 2 and the pod ran on the new node. CA then declared the NVSentinel-cordoned empty node unneeded and removed it (`ScaleDownEmpty`) after the 2 m timer. Scale-from-zero of the CPU node group worked from the discovery tags alone. | Pass |
+| B3 | NTH on a CA-owned managed node. Canonical `aws.health` scheduledChange body on the NTH queue for a CPU node. | NTH matched the instance by provider ID and tag, cordoned it, and stopped (cordonOnly). Canary pod untouched. | Pass |
+| B4 | DRAIN of that node against a `minAvailable: 1` PDB. | `DrainBlocked` with `pdbBlocked` UID, then `TimedOut` after the deadline; the unprotected canary was evicted and CA added a second CPU node for it. PDB honored, no bypass. | Pass |
+| B5 | PURGE with all gates satisfied on the same node. | `Purging` force-deleted exactly the persisted pod UID, `fencingVerified=false`, `Completed`; replacement scheduled on the new CPU node. CA later removed the empty cordoned node. | Pass |
+| B6 | AWS Health `issue` for a GPU node through EventBridge -> KMS SQS -> adapter, code `AWS_EC2_INSTANCE_STORE_DRIVE_PERFORMANCE_DEGRADED`, two-pod JobSet spread across two GPU nodes. | Adapter created one `Fatal/DRAIN` NodeLocal request; the JobSet leader on that node was evicted; JobSet `restarts` 0 -> 1 with new Job and Pod UIDs; CA scaled the GPU group for the replacement and then removed the drained node (`Scale-down: removing empty node`). | Pass |
+| B7 | Gang DRAIN on a JobSet GPU node (`groupPolicy: Gang`, `Fatal`). | Both pods (two nodes) were selected by UID and evicted; `DrainComplete=True/SelectedPodsGone`; JobSet `restarts` 1 -> 2, new Job and Pod UIDs; CA added a third GPU node for the Pending leader and both replacements ran within about 3 minutes. | Pass |
+
+Observations recorded for customers, not defects in this package:
+
+- NVSentinel's node state label stayed at `draining` after the drain completed. In
+  v1.22.0 the transition to `drain-succeeded` and the uncordon belong to the
+  fault-remediation module, which was not enabled. Expect this if you run
+  quarantine + drain without remediation.
+- Cluster Autoscaler does not remove a cordoned node until it is empty *and* unneeded
+  for the configured timer. With a PDB-blocked `TimedOut` drain the node stays
+  cordoned and occupied until an operator decides. That is the intended safety
+  behavior, not a gap.
+- EKS Pod Identity credentials held by an already-running Cluster Autoscaler pod went
+  stale when its IAM association was recreated; a `rollout restart` fixed it. Recreate
+  associations before installing CA, or restart it afterward.
+- `helm install --wait` for NVSentinel timed out (release status `failed`) because the
+  GPU DaemonSets could not become ready before the first GPU node finished booting.
+  Every component came up on its own afterward; a `helm upgrade` clears the status.
+
+## Run A: controller and adapter semantics (CPU nodes)
 
 | # | Scenario | Observed | Result |
 |---|---|---|---|
@@ -34,10 +80,11 @@ Offline suite: `python -m pytest tests -q` passed (66 tests) against the same so
 - Real AWS Health envelopes. Synthetic events mirror the documented schema (bare
   instance IDs, `eventArn`, `eventRegion`, `affectedAccount`, `page/totalPages`) but a
   real event must be captured in dark launch before enabling the real rules.
-- Full NVSentinel (detector -> quarantine -> node-drainer custom drain -> this plugin).
-  The plugin side was validated with template-shaped requests only.
-- Node replacement by Cluster Autoscaler, EKS managed node group repair, or an ASG
-  actuator. The lab had none of these.
 - Organizational AWS Health delivery (`affectedAccount` != receiving account).
-- GPU instances. All scenarios ran on CPU nodes; the controller logic is identical,
-  but GPU scheduling constraints were not exercised.
+- EKS managed node group repair and a fixed-capacity ASG actuator as the replacement
+  owner. Only Cluster Autoscaler was exercised.
+- NVSentinel fault-remediation (the module that moves `draining` to
+  `drain-succeeded` and uncordons). Only quarantine and node-drainer were enabled.
+- Your Cluster Autoscaler flags. Run B used a 2 m scale-down timer to keep the lab
+  fast; production timers, expanders, and priorities change the timing, not the
+  sequence.

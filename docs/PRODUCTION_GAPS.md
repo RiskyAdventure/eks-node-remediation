@@ -1,7 +1,9 @@
 # Production readiness
 
-Version 0.2.1 is a live-validated reference implementation. The items below separate
-what is now implemented from what a customer must still add or decide.
+Version 0.2.x is a live-validated reference implementation (see `VALIDATION.md`,
+including the Cluster Autoscaler + managed node group + NVSentinel + GPU run). The
+items below separate what is now implemented from what a customer must still add or
+decide.
 
 ## Implemented in 0.2.x
 
@@ -51,12 +53,15 @@ Controller and adapter:
 
 Customer decisions:
 
-- Exactly one node-replacement owner per node group (Cluster Autoscaler, EKS managed
-  node group repair, or a scoped fixed-capacity ASG/MNG actuator), validated in
-  staging with the exact versions and flags.
+- Exactly one node-replacement owner per node group. Cluster Autoscaler on managed
+  node groups is validated (`VALIDATION.md` Run B); EKS managed node group repair
+  and a fixed-capacity ASG actuator are documented alternatives that must be
+  validated in staging with the exact versions and flags before use.
 - An independent infrastructure-fencing signal before treating an Integrity purge as
   complete; the controller reports `fencingVerified: false` on purpose.
 - Real AWS Health envelopes captured in dark launch before enabling real rules.
-- If NVSentinel is used: pinned NVSentinel, cert-manager, GPU Operator/device plugin,
-  DCGM, and the two files in `integrations/nvsentinel/` validated end to end.
+- If NVSentinel is used: the chain is validated with v1.22.0 and the files in
+  `integrations/nvsentinel/`; the customer still pins their own NVSentinel, device
+  plugin, and DCGM versions and decides whether to enable fault-remediation (the
+  module that uncordons after `drain-succeeded`). See `integrations/nvsentinel/README.md`.
 - Application checkpointing for distributed jobs; Kubernetes restarts from zero.

@@ -128,10 +128,14 @@ it in customer staging:
 
 - **Cluster Autoscaler** is demand-driven. It adds capacity when pods are Pending
   and removes nodes it considers unneeded; it does not guarantee one-for-one
-  replacement or removal of the specific cordoned instance. Test, with the exact CA
-  version and flags: manually cordoned empty-node scale-down, `safe-to-evict=false`,
-  PDBs, node-group discovery, scale-from-zero, labels/taints, GPU capacity, AZ
-  topology, and minimum sizes.
+  replacement or removal of the specific cordoned instance. Validated here with CA
+  v1.36.1 on managed node groups (VALIDATION.md Run B): a drained node's Pending
+  replacement triggers scale-up of the same node group, and a cordoned node that the
+  drain emptied is removed as `ScaleDownEmpty` once the unneeded timer expires,
+  including nodes NVSentinel cordoned. A node whose drain ended `TimedOut` (PDB)
+  stays cordoned and occupied, by design. Re-test with your exact CA flags:
+  `safe-to-evict=false` annotations, expanders, minimum sizes, AZ topology, and the
+  scale-down timers, which set how long a drained node lingers.
 - **EKS managed node group repair** acts on supported node-monitoring conditions.
   Where it owns a condition, do not run another actuator for the same condition.
 - **Fixed-capacity ASG/MNG actuator** replaces the exact instance after
@@ -148,6 +152,10 @@ device plugin resources, topology, drivers, and scheduler constraints.
 
 ## Validation boundary
 
-The lab used Karpenter only to provision and reclaim disposable nodes. That evidence
-says nothing about Cluster Autoscaler or managed-node-group behavior. Full NVSentinel
-was not installed; real AWS Health envelopes were not captured. See VALIDATION.md.
+Controller and adapter semantics were first validated on Karpenter-provisioned CPU
+nodes (VALIDATION.md Run A). The production shape was then validated end to end
+(Run B): Cluster Autoscaler owning EKS managed node groups, upstream NTH, full upstream
+NVSentinel in custom-drain mode driving this controller from a real injected GPU
+fault, and Cluster Autoscaler replacing and reclaiming nodes after every drain,
+including a Gang drain of a two-node GPU JobSet. Real AWS Health envelopes were not
+captured and remain the dark-launch gate. See VALIDATION.md.

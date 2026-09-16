@@ -40,13 +40,45 @@ honors `deadlineSeconds`, never escalates to force deletion, and reports
   eventually times out; NVSentinel's timeout handling is version-specific.
 - A PDB-blocked drain surfaces as `DrainBlocked` and, after the deadline, `TimedOut`.
   The controller will not bypass the PDB; an operator must decide.
+- `customDrain.timeout` is parsed with `strconv.Atoi`: write integer seconds as a
+  string (`"1800"`), not a Go duration (`"30m"` fails to load).
+
+## Installing NVSentinel on EKS without the GPU Operator
+
+These are the prerequisites that were missing on a stock EKS cluster with NVIDIA
+AMIs (host drivers, `nvidia` containerd runtime, device plugin) and no GPU Operator:
+
+- A DCGM host engine. NVSentinel's gpu-health-monitor connects to DCGM over TCP;
+  `dcgm-hostengine.example.yaml` runs one per GPU node and exposes it as
+  `nvidia-dcgm.nvidia-dcgm.svc:5555` with `internalTrafficPolicy: Local`. Set
+  `global.dcgm.mode: operator-service` and point `global.dcgm.service` at it.
+- A RuntimeClass named `nvidia` (`runtimeclass-nvidia.example.yaml`); the
+  metadata-collector DaemonSet requires it.
+- `labeler.assumeDriverInstalled: true` so the labeler does not wait for a GPU
+  Operator driver label that will never appear.
+- A default StorageClass backed by a CSI driver (the aws-ebs-csi-driver add-on) for
+  the MongoDB store's PersistentVolumeClaims.
+- Schedule the GPU-node DaemonSets with `global.nodeSelector` and
+  `global.tolerations` for your GPU taints. The chart's MongoDB setup Job does not
+  accept tolerations, so the control-plane-style components (MongoDB, fault-quarantine,
+  node-drainer) must land on an untainted general-purpose tier.
+- `helm install --wait` may time out on the first install while GPU nodes are still
+  booting; the components converge on their own and a later `helm upgrade` clears the
+  release status.
 
 ## Validation status
 
-Full NVSentinel (platform-connectors, fault-quarantine, node-drainer,
-gpu-health-monitor) was **not** installed in the lab. The controller's plugin
-behavior was validated standalone by applying DrainRequests shaped like the
-template output (`spec.podsToDrain`, no `nodeUID`). Customer staging must pin
-NVSentinel, cert-manager, GPU Operator/device plugin, and DCGM versions, apply
-these two example files, inject a fault, and observe the node state label move
-`quarantined -> draining -> drain-succeeded` end to end.
+Validated end to end with NVSentinel v1.22.0 (platform-connectors, gpu-health-monitor
+in DCGM 4.x mode, labeler, metadata-collector, MongoDB store, fault-quarantine,
+node-drainer with the values above and the packaged drain template) on an EKS
+managed node group of NVIDIA A10G instances owned by Cluster Autoscaler. An injected
+DCGM fatal error (`dcgmi test --inject -f 230 -v 95`) produced: quarantine cordon with
+`k8saas.nvidia.com/cordon-reason=GPU-fatal-error-ruleset`, a `drain-<node>-<eventID>`
+DrainRequest rendered by node-drainer, controller drain and `DrainComplete=True` 46 s
+after injection, node-drainer "Drain CR completed" and deletion of the request, then
+Cluster Autoscaler removing the empty cordoned node. See `docs/VALIDATION.md` Run B.
+
+Not enabled: fault-remediation. Without it the node state label stops at `draining`
+(the `drain-succeeded` transition and uncordon belong to that module in v1.22.0).
+Customers still pin their own NVSentinel, device plugin, and DCGM versions and rerun
+the injection in staging.

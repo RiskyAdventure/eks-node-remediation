@@ -27,7 +27,7 @@ Read `docs/ARCHITECTURE.md`, `docs/PROVENANCE.md`, `docs/PRODUCTION_GAPS.md`, an
 | `deploy/aws/` | CloudFormation: EventBridge rules, KMS, SQS + DLQ + alarms, IAM, Pod Identity. |
 | `deploy/kubernetes/` | CRD, RBAC, Deployments. |
 | `deploy/helm/nth-values.yaml` | Values for the pinned upstream NTH chart. |
-| `integrations/nvsentinel/` | Drain template + node-drainer values for NVSentinel custom-drain mode. |
+| `integrations/nvsentinel/` | Drain template + node-drainer values for NVSentinel custom-drain mode, plus DCGM host engine and `nvidia` RuntimeClass examples for clusters without the GPU Operator. |
 | `integrations/jobset/` | JobSet example with whole-job restart on eviction. |
 | `examples/` | Example DrainRequests and a PDB-protected workload. |
 | `tests/` | Offline unit tests (`python -m pytest tests -q`). |
@@ -97,6 +97,10 @@ zero. Never auto-uncordon; the health condition may still be real.
 ## Validation
 
 `python -m pytest tests -q` runs offline. `docs/VALIDATION.md` records the live
-results for version 0.2.3. `validation/fixtures/` generates synthetic events for the
-`SyntheticRuleState=ENABLED` rules; `make_nth_sqs_message.py` output must be sent
-directly to the NTH queue because NTH ignores non-`aws.health` sources.
+results for version 0.2.3: controller and adapter semantics (Run A), then the
+production shape with Cluster Autoscaler on EKS managed node groups, upstream NTH,
+full upstream NVSentinel driving this controller from an injected GPU fault, and
+Cluster Autoscaler replacing and reclaiming nodes after every drain (Run B).
+`validation/fixtures/` generates synthetic events for the `SyntheticRuleState=ENABLED`
+rules; `make_nth_sqs_message.py` output must be sent directly to the NTH queue because
+NTH ignores non-`aws.health` sources.
