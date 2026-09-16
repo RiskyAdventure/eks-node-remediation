@@ -9,7 +9,7 @@ affectedEntities[].entityValue is a bare instance ID, matching NTH's parser.
 import argparse
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 parser = argparse.ArgumentParser()
@@ -17,10 +17,15 @@ parser.add_argument("instance_id")
 parser.add_argument("--account-id", required=True)
 parser.add_argument("--region", required=True)
 parser.add_argument("--event-type-code", default="AWS_EC2_INSTANCE_RETIREMENT_SCHEDULED")
+parser.add_argument(
+    "--scheduled-in-minutes", type=int, default=0,
+    help="startTime this many minutes ahead (NTH schedules a drain at startTime - nodeTerminationGracePeriod)",
+)
 args = parser.parse_args()
 if not args.instance_id.startswith("i-"):
     raise SystemExit("instance_id must start with i-")
 now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+start_time = (datetime.now(timezone.utc) + timedelta(minutes=args.scheduled_in_minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
 event = {
     "version": "0",
     "id": str(uuid.uuid4()),
@@ -39,7 +44,7 @@ event = {
         "eventRegion": args.region,
         "affectedAccount": args.account_id,
         "statusCode": "open",
-        "startTime": now,
+        "startTime": start_time,
         "affectedEntities": [{"entityValue": args.instance_id}],
     },
 }

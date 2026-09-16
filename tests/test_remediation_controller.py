@@ -482,6 +482,8 @@ class RunOnceApi(ReconcileApi):
     def get(self, path):
         if path == "/apis/nvsentinel.nvidia.com/v1alpha1/drainrequests":
             return {"items": self.items}
+        if path.startswith("/api/v1/nodes?labelSelector="):
+            return {"items": [self.node]}
         if path.endswith("/drainrequests/newer") or path.endswith("/drainrequests/older"):
             return next(i for i in self.items if path.endswith(i["metadata"]["name"]))
         return super().get(path)
@@ -499,6 +501,158 @@ def test_run_once_blocks_second_request_for_same_node():
     assert by_name["older"]["phase"] == "TargetsLocked"
     assert by_name["newer"]["phase"] == "Blocked"
     assert "owned by DrainRequest node-remediation-system/older" in by_name["newer"]["message"]
+
+
+def test_run_once_blocked_status_carries_reason():
+    older = remediation(name="older", uid="u1", created="2026-01-01T00:00:00Z")
+    newer = remediation(name="newer", uid="u2", created="2026-01-01T00:01:00Z")
+    api = RunOnceApi([newer, older], [pod("worker")])
+    module.Controller(api).run_once()
+    by_name = {path.rsplit("/", 2)[-2]: status for path, status in api.status_patches}
+    assert by_name["newer"]["blockedReason"] == "NodeOwned"
+
+
+# ----- node-group budget -------------------------------------------------------------
+
+def group_node(name, group="mng-a", ready=True, unschedulable=False, workload="managed-cpu"):
+    labels = {"workload": workload}
+    if group:
+        labels["eks.amazonaws.com/nodegroup"] = group
+    return {
+        "metadata": {"name": name, "uid": f"uid-{name}", "labels": labels},
+        "spec": {"unschedulable": unschedulable},
+        "status": {"conditions": [{"type": "Ready", "status": "True" if ready else "False"}]},
+    }
+
+
+def in_flight(name, node_name, phase="Evicting"):
+    value = remediation(name=name, uid=f"uid-{name}", nodeName=node_name)
+    value["status"] = {"phase": phase, "nodeUID": f"uid-{node_name}", "observedGeneration": 1}
+    return value
+
+
+def gate(target, nodes, remediations, max_in_flight=1, min_ready=0):
+    return module.node_group_gate(
+        target, {n["metadata"]["name"]: n for n in nodes}, remediations,
+        "eks.amazonaws.com/nodegroup", "workload", max_in_flight, min_ready,
+    )
+
+
+def test_gate_blocks_when_group_budget_exhausted():
+    nodes = [group_node("a"), group_node("b")]
+    verdict = gate("b", nodes, [in_flight("r1", "a")])
+    assert verdict[0] == "NodeGroupBudget"
+    assert "1 of 1" in verdict[1] and "(a)" in verdict[1]
+    assert gate("b", nodes, [in_flight("r1", "a")], max_in_flight=2) is None
+
+
+def test_gate_ignores_other_groups_terminal_and_preserving_requests():
+    nodes = [group_node("a"), group_node("b"), group_node("c", group="mng-b")]
+    assert gate("b", nodes, [in_flight("r1", "c")]) is None
+    assert gate("b", nodes, [in_flight("r1", "a", phase="Completed")]) is None
+    assert gate("b", nodes, [in_flight("r1", "a", phase="Preserving")]) is None
+    assert gate("b", nodes, [in_flight("r1", "a", phase="TimedOut")]) is None
+
+
+def test_gate_counts_a_node_once_and_never_counts_the_target():
+    nodes = [group_node("a"), group_node("b")]
+    assert gate("b", nodes, [in_flight("r1", "b"), in_flight("r2", "b")]) is None
+    verdict = gate("b", nodes, [in_flight("r1", "a"), in_flight("r2", "a")], max_in_flight=2)
+    assert verdict is None
+
+
+def test_gate_falls_back_to_managed_label_when_no_nodegroup_label():
+    nodes = [group_node("a", group=None), group_node("b", group=None)]
+    assert gate("b", nodes, [in_flight("r1", "a")])[0] == "NodeGroupBudget"
+    nodes = [group_node("a", group=None, workload="managed-gpu"), group_node("b", group=None)]
+    assert gate("b", nodes, [in_flight("r1", "a")]) is None
+
+
+def test_gate_min_ready_counts_only_ready_schedulable_uninvolved_nodes():
+    nodes = [
+        group_node("target"),
+        group_node("ready"),
+        group_node("cordoned", unschedulable=True),
+        group_node("notready", ready=False),
+        group_node("draining"),
+    ]
+    verdict = gate("target", nodes, [in_flight("r1", "draining")], max_in_flight=0, min_ready=2)
+    assert verdict[0] == "NodeGroupCapacity"
+    assert "only 1 ready" in verdict[1]
+    assert gate("target", nodes, [in_flight("r1", "draining")], max_in_flight=0, min_ready=1) is None
+
+
+def test_gate_disabled_or_unknown_node_admits():
+    nodes = [group_node("a"), group_node("b")]
+    assert gate("b", nodes, [in_flight("r1", "a")], max_in_flight=0, min_ready=0) is None
+    assert gate("missing", nodes, [in_flight("r1", "a")]) is None
+
+
+class GroupApi(FakeApi):
+    """Two managed nodes in one node group, each hosting one workload pod."""
+
+    def __init__(self, items):
+        super().__init__()
+        self.items = items
+        self.nodes = {name: group_node(name) for name in ("a", "b")}
+        self.status_patches = []
+
+    def get(self, path):
+        if path == "/apis/nvsentinel.nvidia.com/v1alpha1/drainrequests":
+            return {"items": self.items}
+        if path.startswith("/api/v1/nodes?labelSelector="):
+            return {"items": list(self.nodes.values())}
+        if path.startswith("/api/v1/nodes/"):
+            return self.nodes[path.rsplit("/", 1)[-1]]
+        if path.startswith("/api/v1/pods?fieldSelector="):
+            node_name = path.rsplit("%3D", 1)[-1]
+            return {"items": [pod(f"worker-{node_name}", group=None, owner="ReplicaSet")]}
+        if path == "/api/v1/pods":
+            return {"items": [pod(f"worker-{n}", group=None, owner="ReplicaSet") for n in self.nodes]}
+        if "/drainrequests/" in path:
+            return next(i for i in self.items if path.endswith(i["metadata"]["name"]))
+        raise AssertionError(path)
+
+    def json_patch(self, path, body):
+        super().json_patch(path, body)
+        self.nodes[path.rsplit("/", 1)[-1]]["spec"]["unschedulable"] = True
+
+    def merge_patch(self, path, body):
+        self.status_patches.append((path, body["status"]))
+
+
+def test_run_once_admits_one_request_per_node_group_and_blocks_the_next():
+    first = remediation(name="first", uid="u1", nodeName="a", nodeUID="uid-a", created="2026-01-01T00:00:00Z")
+    second = remediation(name="second", uid="u2", nodeName="b", nodeUID="uid-b", created="2026-01-01T00:01:00Z")
+    api = GroupApi([second, first])
+    module.Controller(api).run_once()
+    by_name = {path.rsplit("/", 2)[-2]: status for path, status in api.status_patches}
+    assert by_name["first"]["phase"] == "TargetsLocked"
+    assert by_name["second"]["phase"] == "Blocked"
+    assert by_name["second"]["blockedReason"] == "NodeGroupBudget"
+    assert [p for p, _ in api.patches] == ["/api/v1/nodes/a"], "only the admitted node was cordoned"
+
+
+def test_run_once_admitted_request_is_never_re_gated(monkeypatch):
+    monkeypatch.setenv("MAX_CONCURRENT_PER_NODE_GROUP", "1")
+    first = remediation(name="first", uid="u1", nodeName="a", nodeUID="uid-a", created="2026-01-01T00:00:00Z")
+    second = remediation(name="second", uid="u2", nodeName="b", nodeUID="uid-b", created="2026-01-01T00:01:00Z")
+    second["status"] = locked_status(pod("worker-b", group=None, owner="ReplicaSet"), node_uid="uid-b")
+    api = GroupApi([first, second])
+    module.Controller(api).run_once()
+    by_name = {path.rsplit("/", 2)[-2]: status for path, status in api.status_patches}
+    assert by_name["second"]["phase"] in {"Evicting", "Completed"}, "already-admitted request keeps going"
+    assert by_name["first"]["phase"] == "Blocked" and by_name["first"]["blockedReason"] == "NodeGroupBudget"
+
+
+def test_run_once_budget_disabled_admits_both(monkeypatch):
+    monkeypatch.setenv("MAX_CONCURRENT_PER_NODE_GROUP", "0")
+    first = remediation(name="first", uid="u1", nodeName="a", nodeUID="uid-a")
+    second = remediation(name="second", uid="u2", nodeName="b", nodeUID="uid-b", created="2026-01-01T00:01:00Z")
+    api = GroupApi([first, second])
+    module.Controller(api).run_once()
+    by_name = {path.rsplit("/", 2)[-2]: status for path, status in api.status_patches}
+    assert by_name["first"]["phase"] == by_name["second"]["phase"] == "TargetsLocked"
 
 
 def test_run_once_skips_terminal_and_records_errors():

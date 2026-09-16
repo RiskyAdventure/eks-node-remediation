@@ -55,7 +55,7 @@ Support). The result is deliberately narrow.
 
 | Signal | Category | Path | Rationale |
 |---|---|---|---|
-| Instance retirement (`*_RETIREMENT_SCHEDULED`, `*_RETIREMENT_EXPEDITED`), stop, termination, reboot maintenance (`*_REBOOT_*_MAINTENANCE_SCHEDULED`) | `scheduledChange` | NTH, cordon-only | The host has degraded memory, storage, network, or power and EC2 has scheduled its replacement. This is how serious host hardware degradation reaches a customer. NTH matches by category, so new codes are covered automatically. |
+| Instance retirement (`*_RETIREMENT_SCHEDULED`, `*_RETIREMENT_EXPEDITED`), stop, termination, reboot maintenance (`*_REBOOT_*_MAINTENANCE_SCHEDULED`) | `scheduledChange` | NTH, cordon-only; optionally also adapter, budgeted DRAIN (`SCHEDULED_CHANGE_ACTION=drain`) | The host has degraded memory, storage, network, or power and EC2 has scheduled its replacement. This is how serious host hardware degradation reaches a customer. NTH matches by category, so new codes are covered automatically. The optional drain path exists because retirement campaigns routinely schedule several instances of one node group for the same minute; see "Correlated retirements" below. |
 | Network and power maintenance that keeps the instance running (`*_NETWORK_MAINTENANCE_SCHEDULED`, `*_POWER_MAINTENANCE_SCHEDULED`) | `scheduledChange` | NTH, cordon-only | Non-destructive, but NTH still cordons because it acts by category. Acceptable: a cordon costs nothing and the ASG/MNG owner may treat it as a rotate signal. |
 | `AWS_EC2_INSTANCE_STORE_DRIVE_PERFORMANCE_DEGRADED` | `issue` | Adapter, DRAIN | The only per-instance `issue` code that describes live hardware degradation on a still-running instance. Local NVMe is failing under running work; drain now. The one `issue` code every internal fleet automates. |
 | `INSTANCE_AVAILABILITY_ISSUE`, `INSTANCE_UNAVAILABLE`, `INSTANCE_AUTO_RECOVERY_FAILURE`, `SIMPLIFIED_AUTO_RECOVERY_FAILURE`, `INSTANCE_POWER_MAINTENANCE_FAILED` | `issue` / `accountNotification` | Not acted on | The instance is already down. Kubernetes marks the node NotReady, EC2 auto-recovery or the ASG/MNG health check replaces it, and draining a dead node achieves nothing. No internal fleet automates these. |
@@ -88,6 +88,16 @@ Safety controls, all live-validated (see VALIDATION.md):
   edits. The CRD makes `nodeName`, `nodeUID`, `podsToDrain`, `faultClass`, `action`,
   `groupPolicy`, `deadlineSeconds` immutable; only `approved` and
   `allowForceAfterDeadline` can change, and the latter only on a PURGE request.
+- **Node-group budget.** Before a request is admitted (its Node fence persisted), the
+  controller counts requests in flight (`NodeLocked` through `Purging`) for nodes in
+  the same node group (`NODE_GROUP_LABEL_KEY`, default the EKS managed-node-group
+  label; fallback: the managed label value) and, optionally, the Ready schedulable
+  nodes the group would keep. Over budget or under the floor, the request waits in
+  `Blocked` with `blockedReason` `NodeGroupBudget` or `NodeGroupCapacity` and is
+  re-evaluated every poll, oldest first. Once admitted a request is never re-gated: a
+  cordoned node must not be abandoned half-drained because a sibling appeared.
+  `Preserving` requests do not hold budget; their cordoned node is counted by the
+  floor instead.
 - **Pre-mutation revalidation.** Before every Eviction or delete the controller
   re-reads the DrainRequest (same UID, same generation, still approved) and the Node
   (same UID, still managed). Any mismatch aborts the batch.
@@ -144,8 +154,49 @@ it in customer staging:
 
 Scheduled retirement is different again: NTH `cordonOnly` does not evict, so at the
 retirement time AWS stops the instance and the remaining pods die non-gracefully.
-The ASG or MNG then replaces the instance on its own health check. If that is not
-acceptable, the customer needs an explicit pre-retirement drain workflow.
+The ASG or MNG then replaces the instance on its own health check. The section below
+is the pre-retirement drain workflow for customers who do not accept that.
+
+## Correlated retirements and the node-group budget
+
+EC2 retires hardware in campaigns. A rack retirement can schedule several instances
+of one node group for the same start time, and outside AWS there is no throttle on how
+many of your instances stop in one window. Inside AWS this exact pattern has caused
+customer-facing outages: an internal fleet lost every instance of a service in one
+Availability Zone when four were stopped within five minutes, and the resulting
+review concluded that any actuator must (a) limit how many nodes of a group are
+being remediated at once and (b) refuse to act when the group would drop below a
+healthy-capacity floor. Both are implemented here and were reproduced live
+(VALIDATION.md Run C):
+
+- With the budget alone (`MAX_CONCURRENT_PER_NODE_GROUP=1`,
+  `MIN_READY_NODES_PER_NODE_GROUP=0`) three simultaneous retirement drains ran
+  strictly one at a time, but each finished in about ten seconds because the pods
+  evicted cleanly, so all three nodes were cordoned within 30 s. Cluster Autoscaler hit
+  the node group's maximum size and the workload sat Pending for about six minutes
+  while it reclaimed the empty nodes and scaled back up. Serialization is not
+  capacity protection.
+- With the floor (`MIN_READY_NODES_PER_NODE_GROUP=2`) the second and third drains were
+  admitted only after Cluster Autoscaler had delivered a replacement node, so the
+  group never fell below two schedulable nodes and the pace of draining became the
+  pace of replacement.
+
+Set `MIN_READY_NODES_PER_NODE_GROUP` for every node group that serves traffic. Size the
+node group's maximum at least `min ready + in-flight budget + 1` above its normal size
+or Cluster Autoscaler cannot replace ahead of removal.
+
+Two ways to feed retirements into that budget:
+
+- **Adapter path (validated).** `SCHEDULED_CHANGE_ACTION=drain` plus the stack's
+  `ScheduledChangeRuleState=ENABLED` deliver `scheduledChange` events to the adapter,
+  which creates one `Recoverable/DRAIN` request per node with a deadline that ends
+  `SCHEDULED_CHANGE_MARGIN_SECONDS` before `detail.startTime`. NTH keeps cordoning
+  from its own queue; the cordon is idempotent and the two never evict the same pod.
+  A drain a PDB refuses ends `TimedOut` and is visible days before EC2 acts.
+- **NTH drain mode (rejected).** `cordonOnly: false` with `nodeTerminationGracePeriod`
+  was tested live: in queue-processor mode NTH drained the node one second after the
+  event arrived, ignoring an 8-minute `startTime`, with no per-group limit. That is an
+  immediate unbudgeted drain of every affected node, which is the failure mode above.
 
 GPU scale-out additionally depends on instance availability, quotas, labels, taints,
 device plugin resources, topology, drivers, and scheduler constraints.

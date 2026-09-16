@@ -28,7 +28,7 @@ KIND = "DrainRequest"
 GPU_RESOURCE = "nvidia.com/gpu"
 GROUP_ANNOTATION = f"{API_GROUP}/group-id"
 COMPONENT = "node-remediation-controller"
-USER_AGENT = f"{COMPONENT}/0.2.3"
+USER_AGENT = f"{COMPONENT}/0.3.0"
 DEFAULT_ACTIONS = {
     "Unknown": "PRESERVE",
     "Recoverable": "DRAIN",
@@ -37,7 +37,12 @@ DEFAULT_ACTIONS = {
 }
 TERMINAL_PHASES = {"Succeeded", "Failed"}
 TERMINAL_REQUEST_PHASES = {"Completed", "NodeNotFound", "TimedOut", "PurgeNotAuthorized"}
+# Phases in which a request is actively reducing a node group's capacity. These count
+# against MAX_CONCURRENT_PER_NODE_GROUP. Preserving is excluded: the cordon is done and
+# the request is waiting on humans; remaining capacity is guarded by the min-ready gate.
+IN_FLIGHT_PHASES = {"NodeLocked", "TargetsLocked", "Evicting", "DrainBlocked", "Purging"}
 DRAIN_COMPLETE = "DrainComplete"
+DEFAULT_NODE_GROUP_LABEL_KEY = "eks.amazonaws.com/nodegroup"
 
 
 class ApiError(RuntimeError):
@@ -192,6 +197,76 @@ def node_owners(remediations):
     return owners
 
 
+def is_admitted(remediation):
+    """A request is admitted once the controller has persisted its Node fence; from
+    then on the node-group gates no longer apply (a cordoned node must not be
+    abandoned half-way because a sibling request appeared)."""
+    return bool(remediation.get("status", {}).get("nodeUID"))
+
+
+def is_in_flight(remediation):
+    return not is_terminal(remediation) and remediation.get("status", {}).get("phase") in IN_FLIGHT_PHASES
+
+
+def node_is_ready(node):
+    for condition in node.get("status", {}).get("conditions", []):
+        if condition.get("type") == "Ready":
+            return condition.get("status") == "True"
+    return False
+
+
+def node_group_of(node, group_key, managed_key):
+    """Node group identity: the EKS managed-node-group label when present, otherwise
+    the managed label value so self-managed groups still get a budget."""
+    labels = node.get("metadata", {}).get("labels", {})
+    return labels.get(group_key) or labels.get(managed_key)
+
+
+def node_group_gate(target_name, nodes_by_name, remediations, group_key, managed_key, max_in_flight, min_ready):
+    """Return None when the request may be admitted, else (reason, message).
+
+    nodes_by_name: every managed Node in the cluster (one list per reconcile pass).
+    remediations: every DrainRequest (the caller's own request is excluded by name
+    matching on the target node, which cannot be in flight yet if it is unadmitted).
+    """
+    target = nodes_by_name.get(target_name)
+    if target is None:
+        return None  # reconcile will report NodeNotFound or the allowlist error
+    group = node_group_of(target, group_key, managed_key)
+    if group is None:
+        return None
+    in_flight_nodes = set()
+    for remediation in remediations:
+        if not is_in_flight(remediation):
+            continue
+        other = nodes_by_name.get(remediation.get("spec", {}).get("nodeName"))
+        if other is not None and node_group_of(other, group_key, managed_key) == group:
+            in_flight_nodes.add(other["metadata"]["name"])
+    in_flight_nodes.discard(target_name)
+    if max_in_flight > 0 and len(in_flight_nodes) >= max_in_flight:
+        return (
+            "NodeGroupBudget",
+            f"Node group {group} has {len(in_flight_nodes)} of {max_in_flight} remediation(s) in flight "
+            f"({', '.join(sorted(in_flight_nodes))}); waiting",
+        )
+    if min_ready > 0:
+        available = [
+            name for name, candidate in nodes_by_name.items()
+            if name != target_name
+            and name not in in_flight_nodes
+            and node_group_of(candidate, group_key, managed_key) == group
+            and node_is_ready(candidate)
+            and candidate.get("spec", {}).get("unschedulable") is not True
+        ]
+        if len(available) < min_ready:
+            return (
+                "NodeGroupCapacity",
+                f"Node group {group} would keep only {len(available)} ready schedulable node(s), "
+                f"below MIN_READY_NODES_PER_NODE_GROUP={min_ready}; waiting",
+            )
+    return None
+
+
 class KubeClient:
     """Minimal in-cluster client. The projected token is re-read on every request so
     kubelet token rotation is honored without a restart."""
@@ -334,6 +409,11 @@ class Controller:
         if not self.label_values:
             raise ValueError("MANAGED_NODE_LABEL_VALUES must contain at least one Node label value")
         self.emit_events = os.environ.get("EMIT_EVENTS", "true").lower() == "true"
+        self.group_key = os.environ.get("NODE_GROUP_LABEL_KEY", DEFAULT_NODE_GROUP_LABEL_KEY)
+        self.max_in_flight = int(os.environ.get("MAX_CONCURRENT_PER_NODE_GROUP", "1"))
+        self.min_ready = int(os.environ.get("MIN_READY_NODES_PER_NODE_GROUP", "0"))
+        if self.max_in_flight < 0 or self.min_ready < 0:
+            raise ValueError("MAX_CONCURRENT_PER_NODE_GROUP and MIN_READY_NODES_PER_NODE_GROUP must be >= 0")
 
     # ----- status and events -------------------------------------------------
 
@@ -506,7 +586,11 @@ class Controller:
         }
 
         def report(values):
-            self.status(namespace, name, {"observedGeneration": generation, **sticky, **values})
+            written = {"observedGeneration": generation, **sticky, **values}
+            self.status(namespace, name, written)
+            # Mirror onto the in-memory object so later requests in the same pass see
+            # this one as admitted / in flight for the node-group gates.
+            remediation.setdefault("status", {}).update(written)
 
         if spec.get("approved") is not True:
             report({"phase": "AwaitingApproval", "message": "spec.approved is not true"})
@@ -667,10 +751,31 @@ class Controller:
                 f"Force-deleted {len(deleted)} pod UID(s); fencingVerified=false", warning=True,
             )
 
+    def managed_nodes(self):
+        selector = urllib.parse.quote(self.label_key, safe="")
+        items = self.api.get(f"/api/v1/nodes?labelSelector={selector}").get("items", [])
+        return {item["metadata"]["name"]: item for item in items}
+
+    def block(self, remediation, reason, message):
+        metadata = remediation["metadata"]
+        if remediation.get("status", {}).get("message") == message:
+            return
+        try:
+            self.status(metadata["namespace"], metadata["name"], {
+                "phase": "Blocked",
+                "blockedReason": reason,
+                "message": message,
+                "observedGeneration": metadata.get("generation"),
+            })
+            self.event(remediation, reason, message)
+        except Exception as status_error:
+            log("status_error", remediation=metadata["name"], error=str(status_error))
+
     def run_once(self):
         path = f"/apis/{API_GROUP}/{API_VERSION}/{RESOURCE}"
-        remediations = self.api.get(path).get("items", [])
+        remediations = sorted(self.api.get(path).get("items", []), key=request_sort_key)
         owners = node_owners(remediations)
+        nodes_by_name = None  # fetched lazily, once per pass, only if a gate needs it
         for remediation in remediations:
             metadata = remediation["metadata"]
             if is_terminal(remediation):
@@ -680,20 +785,29 @@ class Controller:
             node_name = remediation.get("spec", {}).get("nodeName")
             owner = owners.get(node_name)
             if owner is not None and owner["metadata"].get("uid") != metadata.get("uid"):
-                message = (
+                self.block(remediation, "NodeOwned", (
                     f"Node {node_name} is owned by DrainRequest "
                     f"{owner['metadata']['namespace']}/{owner['metadata']['name']} until it is terminal"
-                )
-                if remediation.get("status", {}).get("message") != message:
-                    try:
-                        self.status(namespace, name, {
-                            "phase": "Blocked",
-                            "message": message,
-                            "observedGeneration": metadata.get("generation"),
-                        })
-                    except Exception as status_error:
-                        log("status_error", remediation=name, error=str(status_error))
+                ))
                 continue
+            if (
+                not is_admitted(remediation)
+                and remediation.get("spec", {}).get("approved") is True
+                and (self.max_in_flight > 0 or self.min_ready > 0)
+            ):
+                try:
+                    if nodes_by_name is None:
+                        nodes_by_name = self.managed_nodes()
+                    verdict = node_group_gate(
+                        node_name, nodes_by_name, remediations, self.group_key, self.label_key,
+                        self.max_in_flight, self.min_ready,
+                    )
+                except Exception as error:
+                    log("gate_error", remediation=name, error=str(error))
+                    verdict = ("GateError", f"Node group gate could not be evaluated: {error}")
+                if verdict is not None:
+                    self.block(remediation, *verdict)
+                    continue
             try:
                 self.reconcile(remediation)
             except Exception as error:

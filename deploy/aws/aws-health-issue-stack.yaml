@@ -14,6 +14,20 @@ Parameters:
     Default: DISABLED
     AllowedValues: [ENABLED, DISABLED]
     Description: Synthetic-source rule used only for staging injection tests.
+  ScheduledChangeRuleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: >-
+      Also deliver EC2 scheduledChange events (retirement, host maintenance) to the
+      adapter so it can run a budgeted pre-retirement DRAIN. Requires
+      SCHEDULED_CHANGE_ACTION=drain on the adapter. NTH keeps cordoning from its own
+      queue; the two do not conflict.
+  SyntheticScheduledChangeRuleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Synthetic-source scheduledChange rule for staging injection tests.
   SyntheticEventSource:
     Type: String
     Default: custom.node-remediation.synthetic
@@ -129,6 +143,41 @@ Resources:
         - Id: health-queue
           Arn: !GetAtt EventQueue.Arn
           DeadLetterConfig: {Arn: !GetAtt DeadLetterQueue.Arn}
+  HealthScheduledChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: node-remediation-aws-health-scheduled-change
+      State: !Ref ScheduledChangeRuleState
+      EventPattern:
+        source: [aws.health]
+        detail-type: [AWS Health Event]
+        detail:
+          service: [EC2]
+          eventTypeCategory: [scheduledChange]
+          eventScopeCode: [ACCOUNT_SPECIFIC]
+          statusCode: [open, upcoming]
+      Targets:
+        - Id: health-queue
+          Arn: !GetAtt EventQueue.Arn
+          DeadLetterConfig: {Arn: !GetAtt DeadLetterQueue.Arn}
+          RetryPolicy: {MaximumRetryAttempts: 10, MaximumEventAgeInSeconds: 3600}
+  SyntheticScheduledChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: node-remediation-synthetic-health-scheduled-change
+      State: !Ref SyntheticScheduledChangeRuleState
+      EventPattern:
+        source: [!Ref SyntheticEventSource]
+        detail-type: [AWS Health Event]
+        detail:
+          service: [EC2]
+          eventTypeCategory: [scheduledChange]
+          eventScopeCode: [ACCOUNT_SPECIFIC]
+          statusCode: [open, upcoming]
+      Targets:
+        - Id: health-queue
+          Arn: !GetAtt EventQueue.Arn
+          DeadLetterConfig: {Arn: !GetAtt DeadLetterQueue.Arn}
   QueuePolicy:
     Type: AWS::SQS::QueuePolicy
     Properties:
@@ -143,7 +192,11 @@ Resources:
             Resource: [!GetAtt EventQueue.Arn, !GetAtt DeadLetterQueue.Arn]
             Condition:
               ArnEquals:
-                aws:SourceArn: [!GetAtt HealthIssueRule.Arn, !GetAtt SyntheticIssueRule.Arn]
+                aws:SourceArn:
+                  - !GetAtt HealthIssueRule.Arn
+                  - !GetAtt SyntheticIssueRule.Arn
+                  - !GetAtt HealthScheduledChangeRule.Arn
+                  - !GetAtt SyntheticScheduledChangeRule.Arn
   DeadLetterAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:

@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""AWS Health EC2 *issue* adapter.
+"""AWS Health EC2 adapter (issue events, optionally scheduledChange events).
 
 Consumes AWS Health EventBridge events from SQS, validates the envelope, maps
 affected EC2 instances to managed Kubernetes Nodes by providerID, and creates
 DrainRequest objects for the remediation controller. It never mutates pods or
 nodes and never calls EC2/Auto Scaling APIs.
 """
+import datetime as dt
+import email.utils
 import hashlib
 import json
 import os
@@ -22,7 +24,7 @@ API_GROUP = "nvsentinel.nvidia.com"
 API_VERSION = "v1alpha1"
 RESOURCE = "drainrequests"
 COMPONENT = "aws-health-issue-adapter"
-USER_AGENT = f"{COMPONENT}/0.2.3"
+USER_AGENT = f"{COMPONENT}/0.3.0"
 INSTANCE_ID = re.compile(r"^i-[0-9a-f]{8,17}$")
 PROVIDER_ID = re.compile(r"^aws:///[a-z0-9-]+/(i-[0-9a-f]{8,17})$")
 EXPECTED_ACCOUNT = os.environ["EXPECTED_ACCOUNT"]
@@ -50,8 +52,20 @@ MANAGED_NODE_LABEL_VALUES = {
     if value.strip()
 }
 
+# ignore: scheduledChange events are not consumed here (NTH cordons them by category).
+# drain: also turn every EC2 scheduledChange (retirement, host reboot/maintenance) into
+#        a budgeted DRAIN so the node is emptied under the controller's node-group
+#        budget well before EC2 acts, instead of every affected node hard-stopping at
+#        the same scheduled minute. Requires the ScheduledChangeRuleState rule.
+SCHEDULED_CHANGE_ACTION = os.environ.get("SCHEDULED_CHANGE_ACTION", "ignore").lower()
+# The drain deadline is set so eviction attempts stop this many seconds before the
+# scheduled start; clamped to the CRD's deadlineSeconds range.
+SCHEDULED_CHANGE_MARGIN_SECONDS = int(os.environ.get("SCHEDULED_CHANGE_MARGIN_SECONDS", "1800"))
+DEADLINE_MIN, DEADLINE_MAX = 60, 3600
+
 FATAL_DRAIN = {"faultClass": "Fatal", "action": "DRAIN", "deadlineSeconds": 300}
 PRESERVE_POLICY = {"faultClass": "Unknown", "action": "PRESERVE", "deadlineSeconds": 900}
+SCHEDULED_DRAIN = {"faultClass": "Recoverable", "action": "DRAIN", "deadlineSeconds": DEADLINE_MAX}
 
 # Per-instance AWS Health EC2 *issue* codes and the policy applied when the code is
 # listed in ENABLED_DRAIN_EVENT_CODES. This is deliberately one code. Every other
@@ -66,6 +80,8 @@ POLICIES = {
 
 if UNKNOWN_EVENT_CODE_ACTION not in {"ignore", "preserve"}:
     raise SystemExit("UNKNOWN_EVENT_CODE_ACTION must be ignore or preserve")
+if SCHEDULED_CHANGE_ACTION not in {"ignore", "drain"}:
+    raise SystemExit("SCHEDULED_CHANGE_ACTION must be ignore or drain")
 if UNMAPPED_INSTANCE_POLICY not in {"skip", "fail"}:
     raise SystemExit("UNMAPPED_INSTANCE_POLICY must be skip or fail")
 if not MANAGED_NODE_LABEL_VALUES:
@@ -73,12 +89,42 @@ if not MANAGED_NODE_LABEL_VALUES:
 
 
 def policy_for(event_type):
-    """Return the DrainRequest policy for an event code, or None for no action."""
+    """Return the DrainRequest policy for an issue event code, or None for no action."""
     if event_type in ENABLED_DRAIN_EVENT_CODES:
         return POLICIES.get(event_type, PRESERVE_POLICY)
     if UNKNOWN_EVENT_CODE_ACTION == "preserve":
         return PRESERVE_POLICY
     return None
+
+
+def parse_health_time(value):
+    """AWS Health EventBridge timestamps are RFC 1123 ('Thu, 27 Aug 2026 13:19:03 GMT');
+    accept ISO 8601 too. Return an aware UTC datetime or None."""
+    if not value:
+        return None
+    try:
+        parsed = email.utils.parsedate_to_datetime(str(value))
+    except (TypeError, ValueError):
+        try:
+            parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def scheduled_change_policy(detail, now=None):
+    """DRAIN policy for a scheduledChange: keep evicting politely until
+    SCHEDULED_CHANGE_MARGIN_SECONDS before the scheduled start, within the CRD's
+    deadline range. Unknown or distant start times use the maximum deadline; a start
+    that is already inside the margin uses the minimum so the attempt still happens."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    start = parse_health_time(detail.get("startTime"))
+    if start is None:
+        return dict(SCHEDULED_DRAIN)
+    remaining = int((start - now).total_seconds()) - SCHEDULED_CHANGE_MARGIN_SECONDS
+    return {**SCHEDULED_DRAIN, "deadlineSeconds": max(DEADLINE_MIN, min(DEADLINE_MAX, remaining))}
 
 
 def log(outcome, **fields):
@@ -97,6 +143,10 @@ def instance_id(value):
     return candidate if INSTANCE_ID.fullmatch(candidate) else None
 
 
+def accepted_categories():
+    return {"issue", "scheduledChange"} if SCHEDULED_CHANGE_ACTION == "drain" else {"issue"}
+
+
 def validate_event(event):
     detail = event.get("detail", {})
     checks = {
@@ -105,9 +155,9 @@ def validate_event(event):
         "source": event.get("source") in ALLOWED_SOURCES,
         "detail_type": event.get("detail-type") == "AWS Health Event",
         "service": detail.get("service") == "EC2",
-        "category": detail.get("eventTypeCategory") == "issue",
+        "category": detail.get("eventTypeCategory") in accepted_categories(),
         "scope": detail.get("eventScopeCode") == "ACCOUNT_SPECIFIC",
-        "status": detail.get("statusCode") == "open",
+        "status": detail.get("statusCode") in {"open", "upcoming"},
         # Present on real AWS Health events; must agree with the envelope when present.
         "affected_account": detail.get("affectedAccount", EXPECTED_ACCOUNT) == EXPECTED_ACCOUNT,
         "event_region": detail.get("eventRegion", EXPECTED_REGION) == EXPECTED_REGION,
@@ -256,7 +306,13 @@ def process_message(message, kube):
         # instance, or fleet-level notices). Nothing to map; acknowledge, do not retry.
         log("event_ignored", event_id=source_event_id, event_type=event_type, reason="no EC2 instance IDs in event")
         return {"created": [], "skipped": [], "ignored": True}
-    policy = policy_for(event_type)
+    if event["detail"].get("eventTypeCategory") == "scheduledChange":
+        # Category-level policy, like NTH: every EC2 scheduled change means the host
+        # is going away at startTime. validate_event only admits the category when
+        # SCHEDULED_CHANGE_ACTION=drain.
+        policy = scheduled_change_policy(event["detail"])
+    else:
+        policy = policy_for(event_type)
     if policy is None:
         log(
             "event_ignored",

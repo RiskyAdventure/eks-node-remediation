@@ -157,6 +157,65 @@ def test_non_issue_categories_are_rejected():
             adapter.validate_event(bad)
 
 
+# ----- scheduledChange pre-retirement drain (opt-in) ----------------------------------
+
+RETIREMENT = "AWS_EC2_INSTANCE_RETIREMENT_SCHEDULED"
+
+
+def scheduled(*instances, start="Thu, 27 Aug 2026 13:19:03 GMT", code=RETIREMENT, **overrides):
+    return event(*instances, code=code, eventTypeCategory="scheduledChange", startTime=start, **overrides)
+
+
+def test_scheduled_change_is_rejected_unless_opted_in():
+    with pytest.raises(ValueError, match="category"):
+        adapter.validate_event(scheduled())
+
+
+def test_scheduled_change_accepted_with_open_or_upcoming_status(monkeypatch):
+    monkeypatch.setattr(adapter, "SCHEDULED_CHANGE_ACTION", "drain")
+    assert adapter.validate_event(scheduled()) == [INSTANCE]
+    assert adapter.validate_event(scheduled(statusCode="upcoming")) == [INSTANCE]
+    with pytest.raises(ValueError, match="status"):
+        adapter.validate_event(scheduled(statusCode="closed"))
+
+
+def test_parse_health_time_accepts_rfc1123_and_iso():
+    rfc = adapter.parse_health_time("Thu, 27 Aug 2026 13:19:03 GMT")
+    iso = adapter.parse_health_time("2026-08-27T13:19:03Z")
+    assert rfc == iso and rfc.tzinfo is not None
+    assert adapter.parse_health_time("not a date") is None
+    assert adapter.parse_health_time(None) is None
+
+
+def test_scheduled_change_deadline_stops_before_start_within_crd_bounds():
+    now = adapter.parse_health_time("2026-08-27T12:00:00Z")
+    # start in 45 min, margin 30 min -> 15 min of polite eviction
+    policy = adapter.scheduled_change_policy({"startTime": "2026-08-27T12:45:00Z"}, now=now)
+    assert policy == {"faultClass": "Recoverable", "action": "DRAIN", "deadlineSeconds": 900}
+    # far away -> CRD maximum; already inside the margin -> CRD minimum, still attempted
+    assert adapter.scheduled_change_policy({"startTime": "2026-09-27T12:00:00Z"}, now=now)["deadlineSeconds"] == 3600
+    assert adapter.scheduled_change_policy({"startTime": "2026-08-27T12:10:00Z"}, now=now)["deadlineSeconds"] == 60
+    assert adapter.scheduled_change_policy({}, now=now)["deadlineSeconds"] == 3600
+
+
+def test_scheduled_change_drains_every_code_in_the_category(monkeypatch):
+    monkeypatch.setattr(adapter, "SCHEDULED_CHANGE_ACTION", "drain")
+    kube = RecordingKube([node(INSTANCE), node(OTHER, name="cpu-node", workload="managed-cpu")])
+    for code in (RETIREMENT, "AWS_EC2_PERSISTENT_INSTANCE_RETIREMENT_SCHEDULED", "AWS_EC2_INSTANCE_REBOOT_MAINTENANCE_SCHEDULED"):
+        kube.created.clear()
+        result = adapter.process_message({"Body": json.dumps(scheduled(INSTANCE, OTHER, code=code, event_arn=f"arn:x/{code}"))}, kube)
+        assert len(result["created"]) == 2 and not result["ignored"]
+        assert {p["action"] for _, _, p in kube.created} == {"DRAIN"}
+        assert {p["faultClass"] for _, _, p in kube.created} == {"Recoverable"}
+
+
+def test_scheduled_change_does_not_widen_issue_policy(monkeypatch):
+    monkeypatch.setattr(adapter, "SCHEDULED_CHANGE_ACTION", "drain")
+    kube = RecordingKube([node()])
+    result = adapter.process_message({"Body": json.dumps(event(code="AWS_EC2_SOMETHING_UNKNOWN"))}, kube)
+    assert result["ignored"] and not kube.created
+
+
 # ----- idempotency -------------------------------------------------------------------
 
 def test_drain_request_name_is_stable_across_health_updates_and_pages():

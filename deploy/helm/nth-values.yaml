@@ -1,13 +1,21 @@
 # Production-oriented NTH Queue Processor values. Render QUEUE_URL and select
 # controller placement appropriate for the target cluster.
 enableSqsTerminationDraining: true
+# cordonOnly stays true. In queue-processor mode `cordonOnly: false` drains the moment
+# the message arrives, ignoring the event's startTime and nodeTerminationGracePeriod
+# (validated live), with no per-node-group limit. Pre-retirement draining belongs to
+# the adapter (SCHEDULED_CHANGE_ACTION=drain) where the controller budgets it.
 cordonOnly: true
+# Never set podTerminationGracePeriod: it overrides every workload's own grace period.
 checkTagBeforeDraining: true
 managedTag: aws-node-termination-handler/managed
 useProviderId: true
 queueURL: __QUEUE_URL__
 awsRegion: __AWS_REGION__
-replicas: 2
+# One replica on purpose: NTH pods are stateless and multiple replicas can process the
+# same SQS message twice (duplicate drains/webhooks). One replica handles hundreds of
+# messages per minute; large internal fleets run exactly one per cluster.
+replicas: 1
 emitKubernetesEvents: true
 jsonLogging: true
 logFormatVersion: 2

@@ -28,7 +28,7 @@ spec:
                 topologyKey: kubernetes.io/hostname
       containers:
         - name: controller
-          image: REPLACE_WITH_CUSTOMER_ECR/node-remediation-controller:0.2.3
+          image: REPLACE_WITH_CUSTOMER_ECR/node-remediation-controller:0.3.0
           env:
             - {name: ENABLE_PURGE, value: "false"}
             - {name: ALLOWED_NAMESPACES, value: "REPLACE_WITH_REVIEWED_NAMESPACES"}
@@ -38,6 +38,15 @@ spec:
             - {name: LEADER_ELECTION, value: "true"}
             - {name: LEASE_DURATION_SECONDS, value: "30"}
             - {name: EMIT_EVENTS, value: "true"}
+            # Node-group budget: at most this many nodes of one node group may be in
+            # flight (NodeLocked..Purging) at once; later requests wait in Blocked.
+            # 0 disables. Groups are identified by NODE_GROUP_LABEL_KEY, falling back
+            # to the managed label value.
+            - {name: NODE_GROUP_LABEL_KEY, value: "eks.amazonaws.com/nodegroup"}
+            - {name: MAX_CONCURRENT_PER_NODE_GROUP, value: "1"}
+            # Do not admit a request if the node group would keep fewer than this many
+            # Ready, schedulable, uninvolved nodes. 0 disables.
+            - {name: MIN_READY_NODES_PER_NODE_GROUP, value: "0"}
             - name: POD_NAME
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
             - name: POD_NAMESPACE

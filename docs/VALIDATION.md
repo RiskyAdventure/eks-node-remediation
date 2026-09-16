@@ -53,6 +53,42 @@ Observations recorded for customers, not defects in this package:
   GPU DaemonSets could not become ready before the first GPU node finished booting.
   Every component came up on its own afterward; a `helm upgrade` clears the status.
 
+## Run C: lessons from internal EKS fleets (package 0.3.0)
+
+Same cluster, one CPU managed node group (c6a.large, min 2, max 4, three nodes
+occupied), Cluster Autoscaler v1.36.1 with a 2 m unneeded timer, NTH 1.25.6, adapter
+with `SCHEDULED_CHANGE_ACTION=drain` and `SCHEDULED_CHANGE_MARGIN_SECONDS=120`,
+controller 0.3.0. Workloads: a 3-replica Deployment with hard pod anti-affinity (one
+pod per node), a StatefulSet with a gp3 EBS PersistentVolumeClaim, a `minAvailable: 1`
+single-replica Deployment. Motivation for each scenario is in `ARCHITECTURE.md`
+"Correlated retirements and the node-group budget".
+
+| # | Scenario | Observed | Result |
+|---|---|---|---|
+| C1 | One synthetic `AWS_EC2_INSTANCE_RETIREMENT_SCHEDULED` event naming all three instances of the node group, `startTime` 6 min ahead, budget `MAX_CONCURRENT_PER_NODE_GROUP=1`, floor off. | Adapter created three `Recoverable/DRAIN` requests with `deadlineSeconds: 237` (6 min minus the 2 min margin minus elapsed). Controller admitted the oldest and put the other two in `Blocked/NodeGroupBudget` naming the in-flight node; each was admitted the poll after its predecessor reached `Completed` (14:12:48, 14:12:59, 14:13:10). Strictly one in flight at all times. | Pass |
+| C2 | Consequence of C1 with no capacity floor. | Every drain finished in about 10 s, so all three nodes were cordoned within 30 s. Cluster Autoscaler scaled 3 -> 4, hit the node group maximum, and two Deployment replicas plus the StatefulSet stayed Pending for about 6 minutes until CA removed the empty cordoned nodes and scaled up again. Serialization alone does not protect capacity. | Pass (reproduces the internal COE failure mode) |
+| C3 | C1 repeated with `MIN_READY_NODES_PER_NODE_GROUP=2`, `startTime` 15 min ahead. | First drain admitted (two other ready nodes). Second and third held in `Blocked/NodeGroupCapacity` ("would keep only 1 ready schedulable node(s)"); each was admitted only after Cluster Autoscaler had brought a replacement node to Ready. The group never had fewer than two schedulable nodes; total time governed by CA's replace-then-reclaim cycle at the group maximum. | Pass |
+| C4 | StatefulSet with an EBS PVC through DRAIN and CA reclaim (C1 to C3). | Volume detached with the evicted pod; `SuccessfulAttachVolume` on the replacement 11 s after it scheduled. No stuck volume across three drains and two CA reclaims. Observation: the PV pins the pod to its Availability Zone (`didn't match PersistentVolume's node affinity`); in a multi-AZ node group Cluster Autoscaler cannot target that zone, so the pod waited until CA happened to add a node there. | Pass, with observation |
+| C5 | NTH drain mode (`cordonOnly: false`, `nodeTerminationGracePeriod: 180`) with a canonical scheduledChange whose `startTime` was 8 min ahead. | NTH logged "Requesting instance drain" and "Node successfully cordoned and drained" one second after receiving the message, ignoring `startTime` and the grace period. Immediate, unbudgeted drain. Reverted to `cordonOnly: true`; the adapter path (C1 to C3) is the supported pre-retirement drain. | Fail (rejected as a mechanism) |
+| C6 | EKS managed node group auto repair + Node Monitoring Agent v1.7.1 enabled on the group; DRAIN of a node whose only pod is PDB-protected (`DrainBlocked`); kubelet then stopped on that node over SSM at 14:39:10. | Node `Ready=Unknown` at 14:39:59 (NMA conditions stayed True: kubelet death is not a kernel/storage/network fault). 14:44:59 the `unreachable` taint evicted the pod; the Deployment replaced it elsewhere and, with the PDB satisfied, the controller moved to `Evicting`; the eviction was accepted but the pod object stays `Terminating` forever on a dead kubelet. 15:09:53 Cluster Autoscaler's unready scale-down (20 min default) terminated the instance through the ASG, before node repair's 30 min `Ready` threshold. The MNG `Terminate-LC-Hook` (1800 s) then held the instance in `Terminating:Wait` for MNG's own best-effort drain. See C7 for the DrainRequest outcome. | Pass, with findings below |
+| C7 | Outcome of the DrainRequest from C6 once the instance actually went away. | The stuck `Terminating` pod object was removed at 15:26:03 as MNG's lifecycle drain completed and the instance entered `shutting-down` (47 minutes after kubelet died; 16 minutes after Cluster Autoscaler's decision). On its next poll the controller found no selected UID left and reported `Completed` with `DrainComplete=True/SelectedPodsGone`, correctly and without ever force-deleting. The Node object was still present (`NotReady,SchedulingDisabled`) at that moment; the cloud node lifecycle controller removes it after the instance terminates. | Pass |
+
+Findings for customers from C6, none of which are defects in this package:
+
+- Four actuators act on one NotReady managed node with no coordination: the taint
+  manager (5 min eviction), Cluster Autoscaler (`--scale-down-unready-time`, 20 min),
+  EKS node repair (30 min for `Ready`), and the MNG termination lifecycle hook (best
+  effort drain up to 30 min). This controller is a fifth and the only one that is
+  PDB-strict and never force-terminates. Decide explicitly who owns "kubelet dead":
+  with Cluster Autoscaler running, it is CA, and node repair is redundant for that
+  condition. Node repair remains valuable for the NMA conditions CA does not see
+  (`StorageReady`, `NetworkingReady`, `KernelReady`, `AcceleratedHardwareReady`).
+- A dead kubelet cannot honor an eviction. The controller's `Evicting` phase is
+  accurate (the API accepted it) but `DrainComplete` can never be reached until the
+  Node object is deleted. This is the `fencingVerified: false` story in practice.
+- The MNG lifecycle hook means "instance terminated" is not immediate even after CA
+  decides: budget for up to 30 more minutes when the kubelet is down.
+
 ## Run A: controller and adapter semantics (CPU nodes)
 
 | # | Scenario | Observed | Result |

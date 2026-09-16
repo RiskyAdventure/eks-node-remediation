@@ -20,6 +20,10 @@ decide.
   pagination, and duplicate delivery; 409 treated as existing.
 - Explicit unknown-event-code policy (default: no action) and unmapped-instance
   policy (default: skip and acknowledge); ambiguous mappings always fail.
+- Per-node-group concurrency budget and ready-node floor (0.3.0), admitted oldest
+  first, so correlated retirements drain at the pace the capacity layer replaces.
+- Optional budgeted pre-retirement DRAIN for `scheduledChange` events (0.3.0),
+  deadline anchored to the event's `startTime`.
 - `detail.affectedAccount` / `detail.eventRegion` validation when present.
 - KMS key policy scoped with `aws:SourceAccount`; DLQ and stalled-queue alarms;
   EventBridge target retry policy; synthetic rules parameterized and disabled by default.
@@ -40,8 +44,14 @@ Controller and adapter:
 - SQS visibility extension for slow processing and explicit backoff; today a message
   that exceeds 60 s is redelivered.
 - Dead-letter replay runbook and tooling.
-- Fleet, AZ, and node-group concurrent-remediation budgets (how many nodes may be
-  cordoned or draining at once). The per-event cap is the only limit today.
+- Fleet-wide and per-AZ budgets. The per-node-group budget and ready-node floor are
+  implemented (0.3.0); a limit across node groups or per Availability Zone is not.
+- Zonal Shift awareness. EKS managed node group repair pauses while a Zonal Shift is
+  active; this controller does not. A customer using Zonal Shift should wire the kill
+  switch (disable rules, scale to zero) into the shift, or add a pause flag.
+- Prometheus metrics for NTH are available (`enablePrometheusServer`); alarm on
+  `actions_total{status="error"}`, the events-error counter, and the managed-node
+  gauge as large internal fleets do. Nothing in this package deploys the alarms.
 - Organizational AWS Health delivery: the adapter is single-account. If a management
   account receives events for member accounts, `account` != `affectedAccount` and the
   envelope check must be redesigned.

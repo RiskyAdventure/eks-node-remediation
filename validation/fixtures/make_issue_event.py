@@ -9,7 +9,7 @@ eventRegion, affectedAccount). Put the event with:
 import argparse
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 parser = argparse.ArgumentParser()
@@ -20,6 +20,11 @@ parser.add_argument("--source", default="custom.node-remediation.synthetic")
 parser.add_argument("--event-type-code", default="AWS_EC2_INSTANCE_STORE_DRIVE_PERFORMANCE_DEGRADED")
 parser.add_argument("--event-id", default=None, help="stable Health event id; random when omitted")
 parser.add_argument("--output", default="eventbridge-entry.json")
+parser.add_argument(
+    "--scheduled-in-minutes", type=int, default=None,
+    help="emit a scheduledChange (retirement) instead of an issue, with startTime this many minutes ahead "
+         "in the RFC 1123 form AWS Health uses; pair with --event-type-code AWS_EC2_INSTANCE_RETIREMENT_SCHEDULED",
+)
 args = parser.parse_args()
 for instance in args.instance_ids:
     if not instance.startswith("i-"):
@@ -27,19 +32,26 @@ for instance in args.instance_ids:
 
 event_id = args.event_id or uuid.uuid4().hex[:16]
 now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+scheduled = args.scheduled_in_minutes is not None
+start_time = now
+if scheduled:
+    start = datetime.now(timezone.utc) + timedelta(minutes=args.scheduled_in_minutes)
+    start_time = start.strftime("%a, %d %b %Y %H:%M:%S GMT")
 detail = {
     "eventArn": f"arn:aws:health:{args.region}::event/EC2/{args.event_type_code}/{args.event_type_code}_{event_id}",
     "service": "EC2",
     "eventTypeCode": args.event_type_code,
-    "eventTypeCategory": "issue",
+    "eventTypeCategory": "scheduledChange" if scheduled else "issue",
     "eventScopeCode": "ACCOUNT_SPECIFIC",
     "eventRegion": args.region,
     "affectedAccount": args.account_id,
     "statusCode": "open",
-    "startTime": now,
+    "startTime": start_time,
     "lastUpdatedTime": now,
     "eventDescription": [{"language": "en_US", "latestDescription": "Synthetic staging event"}],
-    "affectedEntities": [{"entityValue": instance, "status": "IMPAIRED"} for instance in args.instance_ids],
+    "affectedEntities": [
+        {"entityValue": instance, "status": "PENDING" if scheduled else "IMPAIRED"} for instance in args.instance_ids
+    ],
     "page": "1",
     "totalPages": "1",
 }
