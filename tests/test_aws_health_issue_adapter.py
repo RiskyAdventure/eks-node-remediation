@@ -123,12 +123,38 @@ def test_rejects_blast_radius_overflow(monkeypatch):
         adapter.validate_event(event(INSTANCE, OTHER, "i-00000000000000001"))
 
 
-def test_event_without_instances_is_rejected():
-    bad = event()
-    bad["detail"]["affectedEntities"] = [{"entityValue": "vol-123"}]
-    bad["resources"] = []
-    with pytest.raises(ValueError, match="no valid EC2 instance"):
-        adapter.validate_event(bad)
+def test_event_without_instances_is_ignored_not_retried():
+    value = event()
+    value["detail"]["affectedEntities"] = [{"entityValue": "vol-123"}]
+    value["resources"] = []
+    assert adapter.validate_event(value) == []
+    kube = RecordingKube([node()])
+    result = adapter.process_message({"Body": json.dumps(value)}, kube)
+    assert result["ignored"] is True and kube.created == []
+
+
+def test_classified_codes_match_internal_fleet_precedent():
+    """Internal EKS/GPU fleets action every scheduledChange (via NTH) and exactly one
+    issue code. Instance-down notices, bandwidth constraints, AZ/network health, and
+    UltraServer maintenance are deliberately not classified here."""
+    assert adapter.POLICIES == {"AWS_EC2_INSTANCE_STORE_DRIVE_PERFORMANCE_DEGRADED": adapter.FATAL_DRAIN}
+    for code in (
+        "AWS_EC2_INSTANCE_CONSTRAINED_BANDWIDTH_ISSUE",
+        "AWS_EC2_INSTANCE_AVAILABILITY_ISSUE",
+        "AWS_EC2_INSTANCE_AUTO_RECOVERY_FAILURE",
+        "AWS_EC2_ULTRASERVER_MAINTENANCE_INITIATED",
+        "AWS_EC2_OPERATIONAL_ISSUE",
+        "AWS_EC2_VPC_NETWORK_HEALTH_INTRA_AZ_ISSUE",
+    ):
+        assert code not in adapter.POLICIES
+        assert adapter.policy_for(code) is None
+
+
+def test_non_issue_categories_are_rejected():
+    for category in ("accountNotification", "scheduledChange", "investigation"):
+        bad = event(eventTypeCategory=category)
+        with pytest.raises(ValueError, match="category"):
+            adapter.validate_event(bad)
 
 
 # ----- idempotency -------------------------------------------------------------------

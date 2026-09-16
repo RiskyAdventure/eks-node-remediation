@@ -28,7 +28,7 @@ spec:
                 topologyKey: kubernetes.io/hostname
       containers:
         - name: controller
-          image: REPLACE_WITH_CUSTOMER_ECR/node-remediation-controller:0.2.1
+          image: REPLACE_WITH_CUSTOMER_ECR/node-remediation-controller:0.2.3
           env:
             - {name: ENABLE_PURGE, value: "false"}
             - {name: ALLOWED_NAMESPACES, value: "REPLACE_WITH_REVIEWED_NAMESPACES"}

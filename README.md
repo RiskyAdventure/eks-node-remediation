@@ -97,6 +97,6 @@ zero. Never auto-uncordon; the health condition may still be real.
 ## Validation
 
 `python -m pytest tests -q` runs offline. `docs/VALIDATION.md` records the live
-results for version 0.2.1. `validation/fixtures/` generates synthetic events for the
+results for version 0.2.3. `validation/fixtures/` generates synthetic events for the
 `SyntheticRuleState=ENABLED` rules; `make_nth_sqs_message.py` output must be sent
 directly to the NTH queue because NTH ignores non-`aws.health` sources.

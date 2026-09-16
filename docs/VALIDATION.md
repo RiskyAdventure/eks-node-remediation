@@ -1,13 +1,13 @@
 # Live validation record
 
-Package version 0.2.1. Validated 2026-09-16 on an isolated, non-production Amazon EKS
+Package version 0.2.3 (policy and adapter behavior identical to the 0.2.1 run except where noted). Validated 2026-09-16 on an isolated, non-production Amazon EKS
 cluster (Kubernetes v1.36, us-west-2) using images built from this repository with
 the packaged Dockerfiles and deployed from the packaged manifests (placeholders
 rendered, nothing else changed). Karpenter provisioned the disposable c6a.large test
 nodes; it is **not** part of the solution and none of the results below say anything
 about Cluster Autoscaler, managed-node-group, or Auto Scaling group behavior.
 
-Offline suite: `python -m pytest tests -q` passed (64 tests) against the same source.
+Offline suite: `python -m pytest tests -q` passed (66 tests) against the same source.
 
 | # | Scenario | Observed | Result |
 |---|---|---|---|
@@ -26,6 +26,7 @@ Offline suite: `python -m pytest tests -q` passed (64 tests) against the same so
 | 7d | Same event delivered twice | `drain_request_exists`; still one DrainRequest (name derived from `eventArn` + instance). | Pass |
 | 7e | `OBSERVE_ONLY=true` (package default) | `event_observed` with `would_create` name; no DrainRequest. | Pass |
 | 8 | NTH 1.25.6 (chart 0.27.6, EKS Pod Identity), canonical `aws.health` scheduledChange body on the NTH queue | NTH resolved the instance by provider ID (`checkTagBeforeDraining` satisfied by the `aws-node-termination-handler/managed=true` tag), cordoned the Node, and stopped (cordonOnly); canary pod `Running`, 0 restarts. | Pass |
+| 7f | Account-specific issue event with no instance IDs (0.2.3, re-tested live through EventBridge) | `event_ignored: no EC2 instance IDs in event`, message acknowledged, queue and DLQ depth 0. Previously this was retried into the DLQ. | Pass |
 | 9 | Leader failover (2 controller replicas) | Lease held by one replica; after deleting the leader the lease moved (SIGTERM release) and a new leader logged `leading` in under 13 s. Before the release logic was added, failover took ~60 s (termination grace + lease duration). | Pass |
 
 ## Not validated here (customer staging gates)

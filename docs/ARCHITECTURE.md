@@ -46,6 +46,26 @@ count, and maps each ID to exactly one Node by `spec.providerID`.
   `allowForceAfterDeadline: false`, `groupPolicy: NodeLocal`; the adapter cannot
   express PURGE.
 
+## Which AWS Health signals are acted on
+
+The complete EC2 event-type catalog was reviewed against what production EKS and GPU
+fleets inside AWS actually automate. Enumerate the current catalog yourself with
+`aws health describe-event-types --filter services=EC2` (Business or Enterprise
+Support). The result is deliberately narrow.
+
+| Signal | Category | Path | Rationale |
+|---|---|---|---|
+| Instance retirement (`*_RETIREMENT_SCHEDULED`, `*_RETIREMENT_EXPEDITED`), stop, termination, reboot maintenance (`*_REBOOT_*_MAINTENANCE_SCHEDULED`) | `scheduledChange` | NTH, cordon-only | The host has degraded memory, storage, network, or power and EC2 has scheduled its replacement. This is how serious host hardware degradation reaches a customer. NTH matches by category, so new codes are covered automatically. |
+| Network and power maintenance that keeps the instance running (`*_NETWORK_MAINTENANCE_SCHEDULED`, `*_POWER_MAINTENANCE_SCHEDULED`) | `scheduledChange` | NTH, cordon-only | Non-destructive, but NTH still cordons because it acts by category. Acceptable: a cordon costs nothing and the ASG/MNG owner may treat it as a rotate signal. |
+| `AWS_EC2_INSTANCE_STORE_DRIVE_PERFORMANCE_DEGRADED` | `issue` | Adapter, DRAIN | The only per-instance `issue` code that describes live hardware degradation on a still-running instance. Local NVMe is failing under running work; drain now. The one `issue` code every internal fleet automates. |
+| `INSTANCE_AVAILABILITY_ISSUE`, `INSTANCE_UNAVAILABLE`, `INSTANCE_AUTO_RECOVERY_FAILURE`, `SIMPLIFIED_AUTO_RECOVERY_FAILURE`, `INSTANCE_POWER_MAINTENANCE_FAILED` | `issue` / `accountNotification` | Not acted on | The instance is already down. Kubernetes marks the node NotReady, EC2 auto-recovery or the ASG/MNG health check replaces it, and draining a dead node achieves nothing. No internal fleet automates these. |
+| `INSTANCE_CONSTRAINED_BANDWIDTH_ISSUE` | `issue` | Not acted on | Degraded, not failed; a capacity condition, not a hardware fault. |
+| UltraServer, capacity-block, dedicated-host, Local Zone, AZ network health, API, Spot, ODCR, RI, BYOIP codes | various | Not acted on | Not a per-instance hardware fault, or the affected entity is not an EC2 instance the cluster can map. |
+| GPU or accelerator degradation | none exists | NVSentinel / EKS node monitoring | AWS Health has no GPU-degradation code. Every internal GPU fleet detects GPU faults in-cluster (DCGM, XID, node problem detection), which is why the NVSentinel path exists. |
+
+Codes that are not enabled create nothing; the adapter logs `event_ignored` with the
+code so a dark launch shows exactly which signals arrive before anything is enabled.
+
 ## Controller policy
 
 The controller owns only workload policy. It has no EC2, Auto Scaling, managed node

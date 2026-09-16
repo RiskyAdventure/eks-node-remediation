@@ -21,7 +21,7 @@ spec:
         - {key: REPLACE_WITH_CONTROL_TIER_TAINT_KEY, operator: Equal, value: REPLACE_WITH_CONTROL_TIER_TAINT_VALUE, effect: NoSchedule}
       containers:
         - name: adapter
-          image: REPLACE_WITH_CUSTOMER_ECR/aws-health-issue-adapter:0.2.1
+          image: REPLACE_WITH_CUSTOMER_ECR/aws-health-issue-adapter:0.2.3
           env:
             - {name: EXPECTED_ACCOUNT, value: "REPLACE_WITH_ACCOUNT_ID"}
             - {name: EXPECTED_REGION, value: "REPLACE_WITH_REGION"}

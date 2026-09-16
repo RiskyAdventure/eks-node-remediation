@@ -22,7 +22,7 @@ API_GROUP = "nvsentinel.nvidia.com"
 API_VERSION = "v1alpha1"
 RESOURCE = "drainrequests"
 COMPONENT = "aws-health-issue-adapter"
-USER_AGENT = f"{COMPONENT}/0.2.1"
+USER_AGENT = f"{COMPONENT}/0.2.3"
 INSTANCE_ID = re.compile(r"^i-[0-9a-f]{8,17}$")
 PROVIDER_ID = re.compile(r"^aws:///[a-z0-9-]+/(i-[0-9a-f]{8,17})$")
 EXPECTED_ACCOUNT = os.environ["EXPECTED_ACCOUNT"]
@@ -50,14 +50,19 @@ MANAGED_NODE_LABEL_VALUES = {
     if value.strip()
 }
 
-POLICIES = {
-    "AWS_EC2_INSTANCE_STORE_DRIVE_PERFORMANCE_DEGRADED": {
-        "faultClass": "Fatal",
-        "action": "DRAIN",
-        "deadlineSeconds": 300,
-    },
-}
+FATAL_DRAIN = {"faultClass": "Fatal", "action": "DRAIN", "deadlineSeconds": 300}
 PRESERVE_POLICY = {"faultClass": "Unknown", "action": "PRESERVE", "deadlineSeconds": 900}
+
+# Per-instance AWS Health EC2 *issue* codes and the policy applied when the code is
+# listed in ENABLED_DRAIN_EVENT_CODES. This is deliberately one code. Every other
+# per-instance Health signal is either a scheduledChange (handled by NTH by category)
+# or an "instance is already down" notice that EC2 auto-recovery and the ASG health
+# check already act on, where draining achieves nothing. See docs/ARCHITECTURE.md
+# "Which AWS Health signals are acted on".
+POLICIES = {
+    # Local instance-store (NVMe) drive is degrading; running work on it is at risk.
+    "AWS_EC2_INSTANCE_STORE_DRIVE_PERFORMANCE_DEGRADED": FATAL_DRAIN,
+}
 
 if UNKNOWN_EVENT_CODE_ACTION not in {"ignore", "preserve"}:
     raise SystemExit("UNKNOWN_EVENT_CODE_ACTION must be ignore or preserve")
@@ -114,8 +119,6 @@ def validate_event(event):
     values = [entity.get("entityValue", "") for entity in detail.get("affectedEntities", [])]
     values.extend(event.get("resources", []))
     ids = sorted({value for raw in values if (value := instance_id(raw))})
-    if not ids:
-        raise ValueError("event contains no valid EC2 instance ID")
     if len(ids) > MAX_INSTANCES_PER_EVENT:
         raise ValueError(f"event exceeds the {MAX_INSTANCES_PER_EVENT}-node blast-radius limit")
     return ids
@@ -248,6 +251,11 @@ def process_message(message, kube):
     instance_ids = validate_event(event)
     source_event_id = stable_event_id(event)
     event_type = event["detail"].get("eventTypeCode", "UNKNOWN")
+    if not instance_ids:
+        # Account-specific EC2 issue with no instance entities (marketplace, reserved
+        # instance, or fleet-level notices). Nothing to map; acknowledge, do not retry.
+        log("event_ignored", event_id=source_event_id, event_type=event_type, reason="no EC2 instance IDs in event")
+        return {"created": [], "skipped": [], "ignored": True}
     policy = policy_for(event_type)
     if policy is None:
         log(

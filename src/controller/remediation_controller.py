@@ -28,7 +28,7 @@ KIND = "DrainRequest"
 GPU_RESOURCE = "nvidia.com/gpu"
 GROUP_ANNOTATION = f"{API_GROUP}/group-id"
 COMPONENT = "node-remediation-controller"
-USER_AGENT = f"{COMPONENT}/0.2.1"
+USER_AGENT = f"{COMPONENT}/0.2.3"
 DEFAULT_ACTIONS = {
     "Unknown": "PRESERVE",
     "Recoverable": "DRAIN",
