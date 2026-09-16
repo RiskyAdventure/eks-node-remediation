@@ -1,0 +1,95 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: drainrequests.nvsentinel.nvidia.com
+spec:
+  group: nvsentinel.nvidia.com
+  scope: Namespaced
+  names:
+    plural: drainrequests
+    singular: drainrequest
+    kind: DrainRequest
+    shortNames: [drainreq]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - {name: Node, type: string, jsonPath: .spec.nodeName}
+        - {name: Fault, type: string, jsonPath: .spec.faultClass}
+        - {name: Action, type: string, jsonPath: .status.effectiveAction}
+        - {name: Phase, type: string, jsonPath: .status.phase}
+        - {name: Approved, type: boolean, jsonPath: .spec.approved}
+        - {name: Age, type: date, jsonPath: .metadata.creationTimestamp}
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [nodeName, faultClass, approved]
+              # Execution fields are immutable after creation. Only approval fields
+              # (approved, allowForceAfterDeadline) may change; a different target,
+              # action, or scope requires a new DrainRequest.
+              x-kubernetes-validations:
+                - rule: "self.nodeName == oldSelf.nodeName"
+                  message: nodeName is immutable
+                - rule: "has(self.nodeUID) == has(oldSelf.nodeUID) && (!has(self.nodeUID) || self.nodeUID == oldSelf.nodeUID)"
+                  message: nodeUID is immutable
+                - rule: "has(self.podsToDrain) == has(oldSelf.podsToDrain) && (!has(self.podsToDrain) || self.podsToDrain == oldSelf.podsToDrain)"
+                  message: podsToDrain is immutable
+                - rule: "self.faultClass == oldSelf.faultClass"
+                  message: faultClass is immutable
+                - rule: "has(self.action) == has(oldSelf.action) && (!has(self.action) || self.action == oldSelf.action)"
+                  message: action is immutable
+                - rule: "self.groupPolicy == oldSelf.groupPolicy"
+                  message: groupPolicy is immutable
+                - rule: "self.deadlineSeconds == oldSelf.deadlineSeconds"
+                  message: deadlineSeconds is immutable
+                - rule: "!has(self.action) || self.action != 'PURGE' || self.faultClass in ['Fatal', 'Integrity']"
+                  message: PURGE is valid only for Fatal or Integrity faults
+                - rule: "!self.allowForceAfterDeadline || (has(self.action) && self.action == 'PURGE')"
+                  message: force-after-deadline requires explicit PURGE
+              properties:
+                nodeName: {type: string, minLength: 1}
+                nodeUID: {type: string, minLength: 1}
+                podsToDrain:
+                  type: object
+                  additionalProperties:
+                    type: array
+                    items: {type: string}
+                sourceProvider: {type: string, enum: [aws, gcp, azure, kubernetes]}
+                sourceEventID: {type: string, maxLength: 256}
+                faultClass: {type: string, enum: [Unknown, Recoverable, Fatal, Integrity]}
+                faultCode: {type: string, maxLength: 256}
+                action: {type: string, enum: [PRESERVE, DRAIN, PURGE]}
+                approved: {type: boolean, default: false}
+                deadlineSeconds: {type: integer, minimum: 60, maximum: 3600, default: 300}
+                allowForceAfterDeadline: {type: boolean, default: false}
+                groupPolicy: {type: string, enum: [NodeLocal, Gang], default: NodeLocal}
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+              properties:
+                phase: {type: string}
+                message: {type: string}
+                observedGeneration: {type: integer}
+                effectiveAction: {type: string}
+                nodeUID: {type: string}
+                deadlineAt: {type: string}
+                fencingVerified: {type: boolean}
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, status]
+                    properties:
+                      type: {type: string}
+                      status: {type: string, enum: ["True", "False", "Unknown"]}
+                      reason: {type: string}
+                      message: {type: string}
+                      observedGeneration: {type: integer}
+                      lastTransitionTime: {type: string}

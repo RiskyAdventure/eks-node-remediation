@@ -1,0 +1,15 @@
+apiVersion: nvsentinel.nvidia.com/v1alpha1
+kind: DrainRequest
+metadata:
+  name: example-recoverable-fault
+  namespace: node-remediation-system
+spec:
+  nodeName: REPLACE_WITH_NODE_NAME
+  nodeUID: REPLACE_WITH_NODE_UID
+  sourceProvider: kubernetes
+  faultClass: Recoverable
+  faultCode: GPU_ROW_REMAP_PENDING
+  action: DRAIN
+  approved: true
+  deadlineSeconds: 300
+  groupPolicy: Gang

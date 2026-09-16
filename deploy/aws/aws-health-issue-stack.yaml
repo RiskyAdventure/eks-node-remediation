@@ -1,0 +1,184 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS Health EC2 issue events -> encrypted SQS for the in-cluster drain adapter
+Parameters:
+  ClusterName: {Type: String, Default: REPLACE_WITH_CLUSTER_NAME}
+  Namespace: {Type: String, Default: node-remediation-system}
+  ServiceAccount: {Type: String, Default: aws-health-issue-adapter}
+  HealthRuleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Real aws.health issue rule. Enable only after dark-launch review.
+  SyntheticRuleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Synthetic-source rule used only for staging injection tests.
+  SyntheticEventSource:
+    Type: String
+    Default: custom.node-remediation.synthetic
+    Description: EventBridge source value used by validation/fixtures/make_issue_event.py.
+  AlarmTopicArn:
+    Type: String
+    Default: ''
+    Description: Optional SNS topic ARN for dead-letter-queue alarms.
+Conditions:
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, '']]
+Resources:
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Customer-managed key for node-remediation issue EventBridge/SQS messages
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableAccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: AllowEventBridgeDeliveryFromThisAccount
+            Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: [kms:Decrypt, kms:GenerateDataKey]
+            Resource: '*'
+            Condition:
+              StringEquals: {aws:SourceAccount: !Ref AWS::AccountId}
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: node-remediation-issue-dlq
+      KmsMasterKeyId: !GetAtt EncryptionKey.Arn
+      MessageRetentionPeriod: 1209600
+  EventQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: node-remediation-issue-events
+      KmsMasterKeyId: !GetAtt EncryptionKey.Arn
+      VisibilityTimeout: 60
+      ReceiveMessageWaitTimeSeconds: 20
+      MessageRetentionPeriod: 345600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+  AdapterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub node-remediation-issue-adapter-${ClusterName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: pods.eks.amazonaws.com}
+            Action: [sts:AssumeRole, sts:TagSession]
+      Policies:
+        - PolicyName: queue-consumer
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ConsumeIssueQueue
+                Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes, sqs:GetQueueUrl]
+                Resource: !GetAtt EventQueue.Arn
+              - Sid: DecryptIssueQueue
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: !GetAtt EncryptionKey.Arn
+  PodIdentityAssociation:
+    Type: AWS::EKS::PodIdentityAssociation
+    Properties:
+      ClusterName: !Ref ClusterName
+      Namespace: !Ref Namespace
+      ServiceAccount: !Ref ServiceAccount
+      RoleArn: !GetAtt AdapterRole.Arn
+  HealthIssueRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: node-remediation-aws-health-issue
+      State: !Ref HealthRuleState
+      EventPattern:
+        source: [aws.health]
+        detail-type: [AWS Health Event]
+        detail:
+          service: [EC2]
+          eventTypeCategory: [issue]
+          eventScopeCode: [ACCOUNT_SPECIFIC]
+          statusCode: [open]
+      Targets:
+        - Id: health-queue
+          Arn: !GetAtt EventQueue.Arn
+          DeadLetterConfig: {Arn: !GetAtt DeadLetterQueue.Arn}
+          RetryPolicy: {MaximumRetryAttempts: 10, MaximumEventAgeInSeconds: 3600}
+  SyntheticIssueRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: node-remediation-synthetic-health-issue
+      State: !Ref SyntheticRuleState
+      EventPattern:
+        source: [!Ref SyntheticEventSource]
+        detail-type: [AWS Health Event]
+        detail:
+          service: [EC2]
+          eventTypeCategory: [issue]
+          eventScopeCode: [ACCOUNT_SPECIFIC]
+          statusCode: [open]
+      Targets:
+        - Id: health-queue
+          Arn: !GetAtt EventQueue.Arn
+          DeadLetterConfig: {Arn: !GetAtt DeadLetterQueue.Arn}
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref EventQueue, !Ref DeadLetterQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRules
+            Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: [!GetAtt EventQueue.Arn, !GetAtt DeadLetterQueue.Arn]
+            Condition:
+              ArnEquals:
+                aws:SourceArn: [!GetAtt HealthIssueRule.Arn, !GetAtt SyntheticIssueRule.Arn]
+  DeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: node-remediation-issue-dlq-messages
+      AlarmDescription: AWS Health issue messages failed processing and need operator replay review
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt DeadLetterQueue.QueueName}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], []]
+  OldestMessageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: node-remediation-issue-queue-stalled
+      AlarmDescription: Issue events are not being consumed; check the adapter Deployment
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt EventQueue.QueueName}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 600
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], []]
+Outputs:
+  QueueUrl: {Value: !Ref EventQueue}
+  QueueArn: {Value: !GetAtt EventQueue.Arn}
+  DeadLetterQueueUrl: {Value: !Ref DeadLetterQueue}
+  RoleArn: {Value: !GetAtt AdapterRole.Arn}
+  KeyArn: {Value: !GetAtt EncryptionKey.Arn}

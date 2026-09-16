@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-remediation-controller
+  namespace: node-remediation-system
+  labels: {app: node-remediation-controller}
+spec:
+  # Additional replicas are passive standbys; only the Lease holder reconciles.
+  replicas: 2
+  selector: {matchLabels: {app: node-remediation-controller}}
+  template:
+    metadata:
+      labels: {app: node-remediation-controller}
+    spec:
+      serviceAccountName: node-remediation-controller
+      automountServiceAccountToken: true
+      priorityClassName: system-cluster-critical
+      # Place on a protected tier the remediation policy never targets.
+      nodeSelector: {REPLACE_WITH_CONTROL_TIER_LABEL_KEY: REPLACE_WITH_CONTROL_TIER_LABEL_VALUE}
+      tolerations:
+        - {key: REPLACE_WITH_CONTROL_TIER_TAINT_KEY, operator: Equal, value: REPLACE_WITH_CONTROL_TIER_TAINT_VALUE, effect: NoSchedule}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector: {matchLabels: {app: node-remediation-controller}}
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: controller
+          image: REPLACE_WITH_CUSTOMER_ECR/node-remediation-controller:0.2.1
+          env:
+            - {name: ENABLE_PURGE, value: "false"}
+            - {name: ALLOWED_NAMESPACES, value: "REPLACE_WITH_REVIEWED_NAMESPACES"}
+            - {name: MANAGED_NODE_LABEL_KEY, value: "workload"}
+            - {name: MANAGED_NODE_LABEL_VALUES, value: "REPLACE_WITH_MANAGED_NODE_LABEL_VALUES"}
+            - {name: POLL_SECONDS, value: "5"}
+            - {name: LEADER_ELECTION, value: "true"}
+            - {name: LEASE_DURATION_SECONDS, value: "30"}
+            - {name: EMIT_EVENTS, value: "true"}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            seccompProfile: {type: RuntimeDefault}
+            capabilities: {drop: ["ALL"]}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 128Mi}

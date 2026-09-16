@@ -1,0 +1,21 @@
+# Production-oriented NTH Queue Processor values. Render QUEUE_URL and select
+# controller placement appropriate for the target cluster.
+enableSqsTerminationDraining: true
+cordonOnly: true
+checkTagBeforeDraining: true
+managedTag: aws-node-termination-handler/managed
+useProviderId: true
+queueURL: __QUEUE_URL__
+awsRegion: __AWS_REGION__
+replicas: 2
+emitKubernetesEvents: true
+jsonLogging: true
+logFormatVersion: 2
+serviceAccount:
+  create: true
+  name: aws-node-termination-handler
+podDisruptionBudget:
+  maxUnavailable: 1
+resources:
+  requests: {cpu: 50m, memory: 64Mi}
+  limits: {memory: 128Mi}

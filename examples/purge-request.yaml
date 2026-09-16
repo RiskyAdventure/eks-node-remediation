@@ -1,0 +1,17 @@
+# Deliberately unapproved. PURGE also requires ENABLE_PURGE=true and purge-rbac.yaml.
+apiVersion: nvsentinel.nvidia.com/v1alpha1
+kind: DrainRequest
+metadata:
+  name: example-integrity-fault
+  namespace: node-remediation-system
+spec:
+  nodeName: REPLACE_WITH_NODE_NAME
+  nodeUID: REPLACE_WITH_NODE_UID
+  sourceProvider: kubernetes
+  faultClass: Integrity
+  faultCode: GPU_DOUBLE_BIT_ECC
+  action: PURGE
+  approved: false
+  deadlineSeconds: 300
+  allowForceAfterDeadline: true
+  groupPolicy: Gang

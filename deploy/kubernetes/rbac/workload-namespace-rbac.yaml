@@ -1,0 +1,26 @@
+# Required once per namespace listed in ALLOWED_NAMESPACES. Grants the controller
+# the Eviction verb in that namespace only, so the software allowlist and RBAC agree.
+# Replace REPLACE_WITH_WORKLOAD_NAMESPACE and apply one copy per namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: node-remediation-controller-evict
+  namespace: REPLACE_WITH_WORKLOAD_NAMESPACE
+rules:
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: node-remediation-controller-evict
+  namespace: REPLACE_WITH_WORKLOAD_NAMESPACE
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: node-remediation-controller-evict
+subjects:
+  - kind: ServiceAccount
+    name: node-remediation-controller
+    namespace: node-remediation-system

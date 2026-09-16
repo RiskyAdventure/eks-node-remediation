@@ -1,0 +1,35 @@
+# Single-replica Deployment with minAvailable=1: Eviction is always rejected (429),
+# which is how a DRAIN request is expected to report DrainBlocked and then TimedOut
+# without bypassing the PodDisruptionBudget.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pdb-workload
+  namespace: REPLACE_WITH_WORKLOAD_NAMESPACE
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: pdb-workload}
+  template:
+    metadata:
+      labels: {app: pdb-workload}
+    spec:
+      nodeSelector: {REPLACE_WITH_NODE_LABEL_KEY: REPLACE_WITH_NODE_LABEL_VALUE}
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: worker
+          image: busybox:1.37
+          command: ["/bin/sh", "-c", "sleep 3600"]
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {memory: 64Mi}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pdb-workload
+  namespace: REPLACE_WITH_WORKLOAD_NAMESPACE
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: pdb-workload}

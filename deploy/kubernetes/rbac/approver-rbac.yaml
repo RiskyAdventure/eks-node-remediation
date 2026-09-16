@@ -1,0 +1,25 @@
+# Bind this Role only to the authenticated group responsible for approving
+# destructive remediation. Replace the placeholder group before deployment.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: node-remediation-approver
+  namespace: node-remediation-system
+rules:
+  - apiGroups: ["nvsentinel.nvidia.com"]
+    resources: ["drainrequests"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: node-remediation-approver
+  namespace: node-remediation-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: node-remediation-approver
+subjects:
+  - kind: Group
+    name: REPLACE_WITH_REMEDIATION_APPROVER_GROUP
+    apiGroup: rbac.authorization.k8s.io

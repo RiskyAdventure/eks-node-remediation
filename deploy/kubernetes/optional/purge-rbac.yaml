@@ -1,0 +1,26 @@
+# Optional, namespace-scoped kill switch for PURGE. Apply one copy per namespace
+# explicitly approved for forced workload deletion, and only together with
+# ENABLE_PURGE=true on the controller. Never apply during PRESERVE/DRAIN rollout.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: node-remediation-controller-purge
+  namespace: REPLACE_WITH_WORKLOAD_NAMESPACE
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: node-remediation-controller-purge
+  namespace: REPLACE_WITH_WORKLOAD_NAMESPACE
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: node-remediation-controller-purge
+subjects:
+  - kind: ServiceAccount
+    name: node-remediation-controller
+    namespace: node-remediation-system

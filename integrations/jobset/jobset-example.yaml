@@ -1,0 +1,79 @@
+# Distributed-job example. Every pod carries the same group-id annotation so a Gang
+# DrainRequest selects the whole job. DisruptionTarget (set by the Eviction API) is
+# mapped to FailJob and the JobSet restarts every child Job together.
+# Replace the placeholder node selector/tolerations with the customer's node group.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: remediation-jobset
+  namespace: REPLACE_WITH_WORKLOAD_NAMESPACE
+spec:
+  failurePolicy:
+    maxRestarts: 2
+    rules:
+      - name: disruption_restarts_all
+        action: RestartJobSet
+        onJobFailureReasons: [PodFailurePolicy]
+  replicatedJobs:
+    - name: leader
+      replicas: 1
+      template:
+        spec:
+          backoffLimit: 0
+          podFailurePolicy:
+            rules:
+              - action: FailJob
+                onPodConditions:
+                  - type: DisruptionTarget
+          template:
+            metadata:
+              labels: {remediation-group: distributed-example}
+              annotations:
+                nvsentinel.nvidia.com/group-id: distributed-example
+            spec:
+              restartPolicy: Never
+              nodeSelector: {REPLACE_WITH_NODE_LABEL_KEY: REPLACE_WITH_NODE_LABEL_VALUE}
+              affinity:
+                podAntiAffinity:
+                  requiredDuringSchedulingIgnoredDuringExecution:
+                    - labelSelector:
+                        matchLabels: {remediation-group: distributed-example}
+                      topologyKey: kubernetes.io/hostname
+              containers:
+                - name: leader
+                  image: busybox:1.37
+                  command: ["/bin/sh", "-c", "sleep 3600"]
+                  resources:
+                    requests: {cpu: 1200m, memory: 64Mi}
+                    limits: {memory: 64Mi}
+    - name: worker
+      replicas: 1
+      template:
+        spec:
+          backoffLimit: 0
+          podFailurePolicy:
+            rules:
+              - action: FailJob
+                onPodConditions:
+                  - type: DisruptionTarget
+          template:
+            metadata:
+              labels: {remediation-group: distributed-example}
+              annotations:
+                nvsentinel.nvidia.com/group-id: distributed-example
+            spec:
+              restartPolicy: Never
+              nodeSelector: {REPLACE_WITH_NODE_LABEL_KEY: REPLACE_WITH_NODE_LABEL_VALUE}
+              affinity:
+                podAntiAffinity:
+                  requiredDuringSchedulingIgnoredDuringExecution:
+                    - labelSelector:
+                        matchLabels: {remediation-group: distributed-example}
+                      topologyKey: kubernetes.io/hostname
+              containers:
+                - name: worker
+                  image: busybox:1.37
+                  command: ["/bin/sh", "-c", "sleep 3600"]
+                  resources:
+                    requests: {cpu: 1200m, memory: 64Mi}
+                    limits: {memory: 64Mi}

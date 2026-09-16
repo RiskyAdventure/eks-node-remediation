@@ -1,0 +1,21 @@
+# NVSentinel Helm values fragment (v1.22.0 contract) that hands the drain stage to
+# this controller. customDrain is mutually exclusive with userNamespaces; leave it
+# empty so node-drainer never evicts pods itself for the same fault.
+node-drainer:
+  userNamespaces: []
+  customDrain:
+    enabled: true
+    templateConfigMapName: node-remediation-drain-template
+    templateMountPath: /etc/drain-template
+    templateFileName: drain-template.yaml
+    namespace: nvsentinel
+    apiGroup: nvsentinel.nvidia.com
+    version: v1alpha1
+    kind: DrainRequest
+    resource: drainrequests
+    statusConditionType: DrainComplete
+    statusConditionStatus: "True"
+    # Seconds node-drainer waits for DrainComplete. Must exceed the controller's
+    # deadlineSeconds plus pod termination grace, otherwise node-drainer gives up
+    # while the controller is still draining.
+    timeout: "1800"

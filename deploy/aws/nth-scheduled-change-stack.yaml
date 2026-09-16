@@ -1,0 +1,172 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS Health EC2 scheduledChange events -> encrypted SQS for upstream NTH (cordonOnly)
+Parameters:
+  ClusterName: {Type: String, Default: REPLACE_WITH_CLUSTER_NAME}
+  Namespace: {Type: String, Default: node-remediation-system}
+  ServiceAccount: {Type: String, Default: aws-node-termination-handler}
+  RealRuleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Real aws.health scheduledChange rule. Enable only after dark-launch review.
+  SyntheticRuleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Synthetic-source rule. NTH ignores non aws.health sources, so this only proves EventBridge routing.
+  SyntheticEventSource:
+    Type: String
+    Default: custom.node-remediation.synthetic
+  AlarmTopicArn:
+    Type: String
+    Default: ''
+Conditions:
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, '']]
+Resources:
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Customer-managed key for node-remediation NTH EventBridge/SQS messages
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableAccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: AllowEventBridgeDeliveryFromThisAccount
+            Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: [kms:Decrypt, kms:GenerateDataKey]
+            Resource: '*'
+            Condition:
+              StringEquals: {aws:SourceAccount: !Ref AWS::AccountId}
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: node-remediation-nth-dlq
+      KmsMasterKeyId: !GetAtt EncryptionKey.Arn
+      MessageRetentionPeriod: 1209600
+  EventQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: node-remediation-nth-events
+      KmsMasterKeyId: !GetAtt EncryptionKey.Arn
+      ReceiveMessageWaitTimeSeconds: 20
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 345600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+  NthRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub node-remediation-nth-${ClusterName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: pods.eks.amazonaws.com}
+            Action: [sts:AssumeRole, sts:TagSession]
+      Policies:
+        - PolicyName: queue-processor
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ConsumeQueue
+                Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes, sqs:GetQueueUrl]
+                Resource: !GetAtt EventQueue.Arn
+              - Sid: DecryptQueue
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: !GetAtt EncryptionKey.Arn
+              - Sid: ResolveManagedInstances
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeTags
+                  - autoscaling:DescribeAutoScalingInstances
+                  - autoscaling:DescribeTags
+                Resource: '*'
+  PodIdentityAssociation:
+    Type: AWS::EKS::PodIdentityAssociation
+    Properties:
+      ClusterName: !Ref ClusterName
+      Namespace: !Ref Namespace
+      ServiceAccount: !Ref ServiceAccount
+      RoleArn: !GetAtt NthRole.Arn
+  RealScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: node-remediation-nth-scheduled-change
+      State: !Ref RealRuleState
+      EventPattern:
+        source: [aws.health]
+        detail-type: [AWS Health Event]
+        detail:
+          service: [EC2]
+          eventTypeCategory: [scheduledChange]
+          statusCode: [open]
+      Targets:
+        - Id: nth-queue
+          Arn: !GetAtt EventQueue.Arn
+          DeadLetterConfig: {Arn: !GetAtt DeadLetterQueue.Arn}
+          RetryPolicy: {MaximumRetryAttempts: 10, MaximumEventAgeInSeconds: 3600}
+  SyntheticScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: node-remediation-nth-synthetic-scheduled-change
+      State: !Ref SyntheticRuleState
+      EventPattern:
+        source: [!Ref SyntheticEventSource]
+        detail-type: [AWS Health Event]
+        detail:
+          service: [EC2]
+          eventTypeCategory: [scheduledChange]
+          statusCode: [open]
+      Targets:
+        - Id: nth-queue
+          Arn: !GetAtt EventQueue.Arn
+          DeadLetterConfig: {Arn: !GetAtt DeadLetterQueue.Arn}
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref EventQueue, !Ref DeadLetterQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRules
+            Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: [!GetAtt EventQueue.Arn, !GetAtt DeadLetterQueue.Arn]
+            Condition:
+              ArnEquals:
+                aws:SourceArn: [!GetAtt RealScheduledRule.Arn, !GetAtt SyntheticScheduledRule.Arn]
+  DeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: node-remediation-nth-dlq-messages
+      AlarmDescription: Scheduled-change messages failed NTH processing and need operator review
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt DeadLetterQueue.QueueName}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], []]
+Outputs:
+  QueueUrl: {Value: !Ref EventQueue}
+  QueueArn: {Value: !GetAtt EventQueue.Arn}
+  DeadLetterQueueUrl: {Value: !Ref DeadLetterQueue}
+  RoleArn: {Value: !GetAtt NthRole.Arn}
+  KeyArn: {Value: !GetAtt EncryptionKey.Arn}

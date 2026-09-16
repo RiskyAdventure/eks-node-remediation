@@ -1,0 +1,41 @@
+# Drain template for NVSentinel node-drainer custom-drain mode, written against the
+# NVSentinel v1.22.0 "Writing a Drain Plugin" contract. node-drainer renders this Go
+# template into a DrainRequest named drain-{node}-{eventID} in the nvsentinel
+# namespace, polls status.conditions for DrainComplete=True, then deletes the CR.
+#
+# Documented template context: .HealthEvent.NodeName and .PodsToDrain. Other
+# HealthEvent fields (checkName, recommendedAction, errorCode, healthEventID,
+# entitiesImpacted, metadata, reason) exist in the health event but their template
+# paths must be confirmed against the pinned release before use; keep them out of
+# the template until verified in staging.
+#
+# node-drainer does NOT set metadata.name/namespace from this template and does not
+# know about nodeUID; the controller persists the Node UID itself (phase NodeLocked)
+# before any mutation.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: node-remediation-drain-template
+  namespace: nvsentinel
+data:
+  drain-template.yaml: |
+    apiVersion: nvsentinel.nvidia.com/v1alpha1
+    kind: DrainRequest
+    spec:
+      nodeName: {{ .HealthEvent.NodeName }}
+      podsToDrain:
+      {{- range $namespace, $pods := .PodsToDrain }}
+        {{ $namespace }}:
+        {{- range $pods }}
+        - {{ . }}
+        {{- end }}
+      {{- end }}
+      sourceProvider: kubernetes
+      # All NVSentinel-triggered drains use the same policy. NVSentinel has already
+      # classified the fault as drain-worthy; PURGE is never templated.
+      faultClass: Fatal
+      action: DRAIN
+      approved: true
+      deadlineSeconds: 900
+      allowForceAfterDeadline: false
+      groupPolicy: NodeLocal
